@@ -112,7 +112,7 @@ if WEB.exists():
 
 @app.get("/")
 async def index():
-    return FileResponse(WEB / "index.html")
+    return FileResponse(WEB / "index.html", media_type="text/html; charset=utf-8")
 
 
 @app.get("/health")
