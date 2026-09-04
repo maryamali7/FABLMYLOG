@@ -1,0 +1,144 @@
+mode: paper  # paper | live
+starting_equity: 10000
+quote_asset: USDT
+loop_interval_sec: 2.0
+candle_interval: 1m
+max_watch_symbols: 40
+
+risk:
+  max_position_pct: 0.12
+  max_open_positions: 8
+  max_daily_loss_pct: 0.04
+  max_drawdown_pct: 0.12
+  stop_loss_pct: 0.018
+  take_profit_pct: 0.035
+  trailing_stop_pct: 0.012
+  min_confidence: 0.58
+  max_spread_bps: 25
+  cooldown_after_loss_sec: 90
+  fee_bps: 10
+  slippage_bps: 5
+
+watchlist:
+  - BTC/USDT
+  - ETH/USDT
+  - SOL/USDT
+  - BNB/USDT
+  - XRP/USDT
+  - DOGE/USDT
+  - ADA/USDT
+  - AVAX/USDT
+  - LINK/USDT
+  - DOT/USDT
+  - LTC/USDT
+  - ATOM/USDT
+  - UNI/USDT
+  - APT/USDT
+  - SUI/USDT
+  - NEAR/USDT
+  - FIL/USDT
+  - ARB/USDT
+  - OP/USDT
+  - TIA/USDT
+  - INJ/USDT
+  - PEPE/USDT
+  - SHIB/USDT
+  - TON/USDT
+  - AAVE/USDT
+
+exchanges:
+  binance:
+    enabled: true
+    ws: wss://stream.binance.com:9443/ws
+    rest: https://api.binance.com
+  bybit:
+    enabled: true
+    ws: wss://stream.bybit.com/v5/public/spot
+    rest: https://api.bybit.com
+  okx:
+    enabled: true
+    ws: wss://ws.okx.com:8443/ws/v5/public
+    rest: https://www.okx.com
+  coinbase:
+    enabled: true
+    ws: wss://ws-feed.exchange.coinbase.com
+    rest: https://api.exchange.coinbase.com
+  kraken:
+    enabled: true
+    ws: wss://ws.kraken.com
+    rest: https://api.kraken.com
+
+strategies:
+  rsi_reversion:
+    enabled: true
+    weight: 1.0
+    period: 14
+    oversold: 32
+    overbought: 68
+  macd_trend:
+    enabled: true
+    weight: 1.1
+    fast: 12
+    slow: 26
+    signal: 9
+  ema_trend:
+    enabled: true
+    weight: 1.0
+    fast: 9
+    slow: 21
+  bollinger:
+    enabled: true
+    weight: 0.9
+    period: 20
+    std: 2.0
+  breakout:
+    enabled: true
+    weight: 0.85
+    lookback: 30
+  grid:
+    enabled: false
+    weight: 0.6
+    levels: 8
+    range_pct: 0.04
+  supertrend:
+    enabled: true
+    weight: 1.15
+    period: 10
+    mult: 3.0
+  ichimoku:
+    enabled: true
+    weight: 1.05
+  stoch_rsi:
+    enabled: true
+    weight: 0.95
+  vwap:
+    enabled: true
+    weight: 0.9
+  adx_trend:
+    enabled: true
+    weight: 1.0
+    min_adx: 18
+  keltner:
+    enabled: true
+    weight: 0.9
+  donchian:
+    enabled: true
+    weight: 0.95
+    period: 20
+  zscore:
+    enabled: true
+    weight: 0.9
+    period: 20
+  vol_climax:
+    enabled: true
+    weight: 0.85
+  roc:
+    enabled: true
+    weight: 0.85
+    period: 12
+  cci:
+    enabled: true
+    weight: 0.85
+  atr_channel:
+    enabled: true
+    weight: 0.8

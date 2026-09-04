@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FablMyLog</title>
+  <link rel="icon" href="/static/logo.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <img src="/static/logo.png" alt="FablMyLog" />
+        <div>
+          <strong>FablMyLog</strong>
+          <span>Crypto robot</span>
+        </div>
+      </div>
+      <nav>
+        <button class="nav on" data-view="overview">Overview</button>
+        <button class="nav" data-view="trade">Trade</button>
+        <button class="nav" data-view="markets">Markets</button>
+        <button class="nav" data-view="screeners">Screeners</button>
+        <button class="nav" data-view="strategies">Strategies</button>
+        <button class="nav" data-view="journal">Journal</button>
+      </nav>
+      <div class="side-foot">
+        <div class="live-dot" id="connDot"></div>
+        <span id="connLabel">Connecting…</span>
+      </div>
+    </aside>
+
+    <div class="main">
+      <header class="top">
+        <div class="search-wrap">
+          <input id="search" placeholder="Search any coin — BTC, ETH, PEPE…" />
+        </div>
+        <div class="badges">
+          <span class="badge teal" id="modePill">PAPER</span>
+          <span class="badge" id="runPill">BOOTING</span>
+          <span class="badge gold" id="regimePill">REGIME</span>
+          <span class="badge dim" id="upPill">00:00:00</span>
+        </div>
+        <div class="actions">
+          <button id="btnStart" class="btn primary">Resume</button>
+          <button id="btnPause" class="btn">Pause</button>
+          <button id="btnFlat" class="btn danger">Flatten</button>
+        </div>
+      </header>
+
+      <div class="kpis" id="kpis"></div>
+      <div class="alerts" id="alerts"></div>
+
+      <section class="view on" data-view="overview">
+        <div class="overview-grid">
+          <div class="card chart-card">
+            <div class="card-h">
+              <div>
+                <h1 id="chartTitle">BTC/USDT</h1>
+                <p class="sub" id="chartSub">Select a market to load candles</p>
+              </div>
+              <div class="price-xl" id="lastPrice">—</div>
+            </div>
+            <canvas id="chart" height="340"></canvas>
+          </div>
+          <div class="stack">
+            <div class="card">
+              <div class="card-h"><h2>Open positions</h2></div>
+              <div id="positions" class="list"></div>
+            </div>
+            <div class="card">
+              <div class="card-h"><h2>Signals</h2></div>
+              <div id="signals" class="list"></div>
+            </div>
+          </div>
+        </div>
+        <div class="two">
+          <div class="card">
+            <div class="card-h"><h2>Order book</h2><span class="sub" id="bookEx"></span></div>
+            <div id="book" class="book"></div>
+          </div>
+          <div class="card">
+            <div class="card-h"><h2>Venue health</h2></div>
+            <div id="feeds" class="feeds"></div>
+            <p class="hint" id="uniHint">Loading markets…</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" data-view="trade">
+        <div class="trade-grid">
+          <div class="card">
+            <div class="card-h"><h2>Manual ticket</h2></div>
+            <form id="ticket" class="ticket">
+              <label>Symbol<input name="symbol" value="BTC/USDT" /></label>
+              <label>Side
+                <select name="side">
+                  <option>buy</option>
+                  <option>sell</option>
+                </select>
+              </label>
+              <div class="ticket-btns">
+                <button class="btn buy" type="submit" data-side="buy">Buy</button>
+                <button class="btn sell" type="button" id="btnSell">Sell</button>
+              </div>
+              <p class="hint">Paper fills on live (or simulated) prices. Live orders stay off until BOT_MODE=live and API keys are set.</p>
+            </form>
+          </div>
+          <div class="card">
+            <div class="card-h"><h2>Recent fills</h2></div>
+            <div id="fills" class="list"></div>
+          </div>
+          <div class="card">
+            <div class="card-h"><h2>Cross-exchange edge</h2></div>
+            <div id="arb" class="list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="view" data-view="markets">
+        <div class="card">
+          <div class="card-h"><h2>Watchlist</h2></div>
+          <div class="table-wrap">
+            <table class="data">
+              <thead>
+                <tr><th>Symbol</th><th>Last</th><th>24h</th><th>Spread</th><th>Venues</th></tr>
+              </thead>
+              <tbody id="tickerBody"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card" style="margin-top:16px">
+          <div class="card-h"><h2>Print tape</h2></div>
+          <div id="tape" class="list tape"></div>
+        </div>
+      </section>
+
+      <section class="view" data-view="screeners">
+        <div class="card">
+          <div class="card-h">
+            <h2>Crypto screeners</h2>
+            <span class="sub" id="screenerMeta">Composite alpha across the watchlist</span>
+          </div>
+          <div class="tabs" id="screenerTabs"></div>
+          <div class="table-wrap">
+            <table class="data">
+              <thead>
+                <tr>
+                  <th>Symbol</th><th>Alpha</th><th>Last</th><th>Chg</th>
+                  <th>RSI</th><th>ADX</th><th>Vol×</th><th>vs BTC</th><th>Bias</th><th></th>
+                </tr>
+              </thead>
+              <tbody id="screenerBody"></tbody>
+            </table>
+          </div>
+          <div class="heat" id="heat"></div>
+        </div>
+      </section>
+
+      <section class="view" data-view="strategies">
+        <div class="card">
+          <div class="card-h">
+            <h2>Strategy desk</h2>
+            <span class="sub">Tap a card to arm or disarm · ATR stops and 50% scale-out are live</span>
+          </div>
+          <div class="strat-grid" id="stratGrid"></div>
+        </div>
+      </section>
+
+      <section class="view" data-view="journal">
+        <div class="card">
+          <div class="card-h"><h2>Robot journal</h2></div>
+          <div id="journal" class="list"></div>
+        </div>
+      </section>
+    </div>
+  </div>
+  <div id="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
