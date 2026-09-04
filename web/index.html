@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FablMyLog — 24/7 Crypto Robot</title>
+  <link rel="icon" href="/static/logo.png" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">
+        <img src="/static/logo.png" alt="FablMyLog" />
+        <div>
+          <div class="name">FABLMYLOG</div>
+          <div class="tag">multi-exchange · 24/7 · all-coin universe</div>
+        </div>
+      </div>
+      <div class="status-pills">
+        <span class="pill" id="modePill">PAPER</span>
+        <span class="pill ghost" id="runPill">BOOTING</span>
+        <span class="pill ghost" id="upPill">UP 00:00:00</span>
+        <span class="pill gold" id="regimePill">REGIME —</span>
+      </div>
+      <div class="actions">
+        <button id="btnStart" class="btn primary">Resume</button>
+        <button id="btnPause" class="btn">Pause</button>
+        <button id="btnFlat" class="btn danger">Flatten</button>
+      </div>
+    </header>
+
+    <section class="kpis" id="kpis"></section>
+    <div class="alerts" id="alerts"></div>
+
+    <section class="panel screener-desk">
+      <div class="panel-h">
+        <h2>Advanced crypto screeners</h2>
+        <div class="legend" id="screenerMeta">composite alpha · volume · RSI · squeeze · vs BTC</div>
+      </div>
+      <div class="tabs" id="screenerTabs"></div>
+      <div class="table-wrap screener-table">
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Alpha</th>
+              <th>Last</th>
+              <th>Chg</th>
+              <th>RSI</th>
+              <th>ADX</th>
+              <th>Vol×</th>
+              <th>vs BTC</th>
+              <th>Bias</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="screenerBody"></tbody>
+        </table>
+      </div>
+      <div class="heat" id="heat"></div>
+    </section>
+
+    <section class="panel strat-desk">
+      <div class="panel-h">
+        <h2>Strategy desk</h2>
+        <span class="muted">click to arm / disarm · ATR stops + 50% scale-out live</span>
+      </div>
+      <div class="strat-grid" id="stratGrid"></div>
+    </section>
+
+    <main class="grid">
+      <aside class="panel markets">
+        <div class="panel-h">
+          <h2>Markets</h2>
+          <input id="search" placeholder="Add any coin — BTC, PEPE, SUI…" />
+        </div>
+        <div class="feeds" id="feeds"></div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Last</th>
+                <th>24h</th>
+                <th>Spread</th>
+                <th>Venues</th>
+              </tr>
+            </thead>
+            <tbody id="tickerBody"></tbody>
+          </table>
+        </div>
+        <div class="universe-hint" id="uniHint">Loading full coin universe…</div>
+      </aside>
+
+      <section class="center">
+        <div class="panel chart-panel">
+          <div class="panel-h">
+            <h2 id="chartTitle">BTC/USDT</h2>
+            <div class="legend">
+              <span class="dot teal"></span> live candles from exchange websockets
+            </div>
+          </div>
+          <canvas id="chart" height="280"></canvas>
+        </div>
+        <div class="split">
+          <div class="panel book">
+            <div class="panel-h"><h2>Order book</h2><span id="bookEx" class="muted"></span></div>
+            <div id="book" class="book-body"></div>
+          </div>
+          <div class="panel tape">
+            <div class="panel-h"><h2>Print tape</h2></div>
+            <div id="tape" class="scroller"></div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="right">
+        <div class="panel">
+          <div class="panel-h"><h2>Open risk</h2></div>
+          <div id="positions" class="scroller pos"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-h"><h2>Ensemble signals</h2></div>
+          <div id="signals" class="scroller"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-h"><h2>Cross-exchange edge</h2></div>
+          <div id="arb" class="scroller"></div>
+        </div>
+      </aside>
+    </main>
+
+    <section class="bottom">
+      <div class="panel grow">
+        <div class="panel-h"><h2>Robot journal</h2></div>
+        <div id="journal" class="scroller"></div>
+      </div>
+      <div class="panel fills">
+        <div class="panel-h"><h2>Fills</h2></div>
+        <div id="fills" class="scroller"></div>
+      </div>
+      <div class="panel ticket">
+        <div class="panel-h"><h2>Manual ticket</h2></div>
+        <form id="ticket">
+          <label>Symbol<input name="symbol" value="BTC/USDT" /></label>
+          <label>Side
+            <select name="side">
+              <option>buy</option>
+              <option>sell</option>
+            </select>
+          </label>
+          <button class="btn primary" type="submit">Send paper order</button>
+          <p class="fine">Live routing stays off until you set BOT_MODE=live and API keys. Default is paper fills on real websocket prices.</p>
+        </form>
+      </div>
+    </section>
+  </div>
+  <div id="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

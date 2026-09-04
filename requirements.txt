@@ -1,0 +1,12 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+websockets==14.1
+aiohttp==3.11.11
+pydantic==2.10.4
+pydantic-settings==2.7.0
+pyyaml==6.0.2
+aiosqlite==0.20.0
+python-dotenv==1.0.1
+numpy==2.2.1
+httpx==0.28.1
+orjson==3.10.12
