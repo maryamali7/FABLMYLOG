@@ -30,13 +30,15 @@ log = logging.getLogger("feeds")
 
 OnTicker = Callable[[Ticker], Awaitable[None] | None]
 OnTrade = Callable[[TradeTick], Awaitable[None] | None]
+#: historical candle backfill: symbol, ts, open, high, low, close, volume
+OnBar = Callable[[str, float, float, float, float, float, float], Awaitable[None] | None]
 OnBook = Callable[[OrderBook], Awaitable[None] | None]
 
 
-async def _maybe(cb, payload) -> None:
+async def _maybe(cb, *payload) -> None:
     if cb is None:
         return
-    res = cb(payload)
+    res = cb(*payload)
     if asyncio.iscoroutine(res):
         await res
 
@@ -51,12 +53,14 @@ class WSClient:
         on_ticker: OnTicker | None = None,
         on_trade: OnTrade | None = None,
         on_book: OnBook | None = None,
+        on_bar: OnBar | None = None,
     ):
         self.url = url
         self.symbols = symbols
         self.on_ticker = on_ticker
         self.on_trade = on_trade
         self.on_book = on_book
+        self.on_bar = on_bar
         self.connected = False
         self.last_msg = 0.0
         self.errors = 0
@@ -505,6 +509,15 @@ BASE_PRICES = {
 }
 
 
+def _weighted_pick(rng: random.Random, weighted: tuple[tuple[str, float], ...]) -> str:
+    roll = rng.random() * sum(w for _, w in weighted)
+    for name, weight in weighted:
+        roll -= weight
+        if roll <= 0:
+            return name
+    return weighted[-1][0]
+
+
 def _base_price(symbol: str) -> float:
     if symbol in BASE_PRICES:
         return BASE_PRICES[symbol]
@@ -518,6 +531,12 @@ class SimulatedFeed(WSClient):
 
     name = "sim"
 
+    #: venues the paper tape pretends to consolidate, with a relative size weight.
+    #: The ``sim:`` prefix is deliberate — these numbers are generated, and no
+    #: table in the UI should ever imply they came off a real exchange.
+    SIM_VENUES = (("sim:binance", 0.34), ("sim:okx", 0.19), ("sim:bybit", 0.18),
+                  ("sim:mexc", 0.12), ("sim:kucoin", 0.09), ("sim:bitget", 0.08))
+
     async def _session(self) -> None:
         rng = random.Random(42)
         prices = {s: _base_price(s) for s in self.symbols}
@@ -529,11 +548,29 @@ class SimulatedFeed(WSClient):
         seed_bars = 5760
         for s, px in prices.items():
             p = px
+            base_vol = max(1.0, 4_000_000.0 / max(px, 1e-9)) * rng.uniform(0.6, 1.5)
             for i in range(seed_bars):
                 ts = now - (seed_bars - i) * 60
+                open_px = p
                 p *= math.exp(rng.gauss(0.00004, 0.0035))
+                # a real intrabar range, not a doji: wicks scale with the move
+                move = abs(p - open_px)
+                wick = max(move * rng.uniform(0.3, 1.6), open_px * rng.uniform(0.0004, 0.0022))
+                high = max(open_px, p) + wick * rng.random()
+                low = min(open_px, p) - wick * rng.random()
+                # volume follows the range, with the usual heavy tail
+                vol = base_vol * (0.4 + move / max(open_px * 0.004, 1e-12)) * rng.uniform(0.5, 1.8)
+                if rng.random() < 0.02:
+                    vol *= rng.uniform(3, 9)
+                await _maybe(self.on_bar, s, ts, open_px, high, low, p, round(vol, 6))
                 await self._emit(s, p, ts, rng, seed=True)
                 prices[s] = p
+        # order-flow state per symbol: a slow-moving aggressor bias, and the
+        # occasional absorption episode where one side keeps hitting and price
+        # refuses to move. Without these the tape is a coin flip and delta
+        # carries no information at all.
+        bias = {s: 0.0 for s in self.symbols}
+        absorb = {s: 0 for s in self.symbols}
         while not self._stop.is_set():
             await asyncio.sleep(0.35)
             ts = time.time()
@@ -541,10 +578,18 @@ class SimulatedFeed(WSClient):
                 shock = rng.gauss(0, 0.00045)
                 if rng.random() < 0.01:
                     shock += rng.choice([-1, 1]) * rng.uniform(0.002, 0.01)
+                bias[s] = bias[s] * 0.97 + rng.gauss(0, 0.35)
+                if absorb[s] > 0:
+                    absorb[s] -= 1
+                    shock *= 0.15          # the move is being absorbed
+                elif rng.random() < 0.004:
+                    absorb[s] = rng.randint(20, 60)
+                    bias[s] = rng.choice([-1, 1]) * rng.uniform(1.4, 2.6)
                 prices[s] *= math.exp(shock)
-                await self._emit(s, prices[s], ts, rng)
+                await self._emit(s, prices[s], ts, rng, bias=bias[s], shock=shock)
 
-    async def _emit(self, symbol: str, last: float, ts: float, rng: random.Random, seed: bool = False) -> None:
+    async def _emit(self, symbol: str, last: float, ts: float, rng: random.Random, seed: bool = False,
+                    bias: float = 0.0, shock: float = 0.0) -> None:
         self._mark()
         spread = last * rng.uniform(0.00012, 0.0004)
         bid = last - spread / 2
@@ -567,15 +612,27 @@ class SimulatedFeed(WSClient):
         )
         if seed:
             return
-        if rng.random() < 0.45:
+        # a burst of prints spread across the simulated venues. The aggressor
+        # side follows the momentum and the slow bias, so cumulative delta
+        # actually leads and lags price the way a real tape does.
+        lean = math.tanh(bias * 0.5 + shock * 900)
+        for _ in range(rng.randint(1, 4)):
+            if rng.random() > 0.55:
+                continue
+            venue = _weighted_pick(rng, self.SIM_VENUES)
+            buy = rng.random() < 0.5 + lean * 0.32
+            # print sizes are fat-tailed: mostly dust, occasionally a whale
+            qty = abs(rng.gauss(0.35, 0.18))
+            if rng.random() < 0.03:
+                qty *= rng.uniform(6, 30)
             await _maybe(
                 self.on_trade,
                 TradeTick(
-                    exchange="sim",
+                    exchange=venue,
                     symbol=symbol,
-                    price=last * (1 + rng.gauss(0, 0.00005)),
-                    qty=abs(rng.gauss(0.4, 0.2)),
-                    side="buy" if rng.random() > 0.5 else "sell",
+                    price=(ask if buy else bid) * (1 + rng.gauss(0, 0.00003)),
+                    qty=round(qty, 6),
+                    side="buy" if buy else "sell",
                     ts=ts,
                 ),
             )

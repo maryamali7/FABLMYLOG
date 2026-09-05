@@ -24,6 +24,7 @@
         <button class="nav on" data-view="overview">Overview</button>
         <button class="nav" data-view="trade">Trade</button>
         <button class="nav" data-view="desk">Trade desk</button>
+        <button class="nav" data-view="volume">Volume dots</button>
         <button class="nav" data-view="risk">Risk &amp; portfolio</button>
         <button class="nav" data-view="markets">Markets</button>
         <button class="nav" data-view="universe">Universe</button>
@@ -238,6 +239,75 @@
             <div class="card">
               <div class="card-h"><h2>Time &amp; sales</h2></div>
               <div id="dkTape" class="list tape"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= VOLUME DOTS ================= -->
+      <section class="view" data-view="volume">
+        <div class="card vd-head">
+          <div class="vd-sym">
+            <input id="vdSymbol" list="vdList" value="BTC/USDT" spellcheck="false" />
+            <datalist id="vdList"></datalist>
+            <div class="desk-quote">
+              <b id="vdLast">—</b>
+              <span id="vdChg" class="pill dim">—</span>
+              <span class="muted small" id="vdSource"></span>
+            </div>
+          </div>
+          <div class="tabs" id="vdTf">
+            <button class="tab" data-tf="5s">5s</button>
+            <button class="tab" data-tf="15s">15s</button>
+            <button class="tab" data-tf="30s">30s</button>
+            <button class="tab on" data-tf="1m">1m</button>
+            <button class="tab" data-tf="5m">5m</button>
+            <button class="tab" data-tf="15m">15m</button>
+            <button class="tab" data-tf="1h">1h</button>
+          </div>
+          <div class="vd-opts">
+            <select id="vdVenue" class="mini"><option value="">all exchanges</option></select>
+            <label><input type="checkbox" id="vdDots" checked /> dots</label>
+            <label><input type="checkbox" id="vdCvd" checked /> CVD</label>
+            <label><input type="checkbox" id="vdLive" checked /> live</label>
+          </div>
+        </div>
+
+        <div class="kpis" id="vdKpis"></div>
+
+        <div class="vd-grid">
+          <div class="card vd-chart-card">
+            <div class="card-h">
+              <h2>Volume dots</h2>
+              <span class="sub" id="vdChartSub">every dot is one bar of consolidated tape</span>
+            </div>
+            <div id="vdChart" class="vd-chart"></div>
+            <div class="vd-legend">
+              <span><i class="dot up"></i> buyers were the aggressors</span>
+              <span><i class="dot down"></i> sellers were the aggressors</span>
+              <span><i class="dot big"></i> size = volume vs the window</span>
+              <span><i class="dot ring"></i> ringed = absorption or divergence</span>
+            </div>
+            <div id="vdHover" class="vd-hover"></div>
+          </div>
+
+          <div class="stack">
+            <div class="card">
+              <div class="card-h"><h2>Next move</h2><span class="sub" id="vdReadSub"></span></div>
+              <div id="vdRead"></div>
+            </div>
+            <div class="card">
+              <div class="card-h"><h2>By exchange</h2><span class="sub">who is buying, who is selling</span></div>
+              <div class="table-wrap">
+                <table class="data">
+                  <thead><tr><th>Venue</th><th>Share</th><th>Buy</th><th>Sell</th><th>Delta</th></tr></thead>
+                  <tbody id="vdVenues"></tbody>
+                </table>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-h"><h2>Size prints</h2><span class="sub">outsized trades on the tape</span></div>
+              <div id="vdPrints" class="list tape"></div>
             </div>
           </div>
         </div>
@@ -986,11 +1056,13 @@
     </div>
   </div>
   <div id="toast"></div>
+  <script src="/static/vendor/lightweight-charts.js"></script>
   <script src="/static/app.js"></script>
   <script src="/static/pro.js"></script>
   <script src="/static/mtf.js"></script>
   <script src="/static/universe.js"></script>
   <script src="/static/bot.js"></script>
   <script src="/static/desk.js"></script>
+  <script src="/static/flow.js"></script>
 </body>
 </html>

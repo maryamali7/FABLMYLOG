@@ -24,6 +24,7 @@ from app.market.venues import MARKETS, VENUES
 from app.universe import PRESETS as UNIVERSE_PRESETS, SORTS as UNIVERSE_SORTS
 from app.keys import TRADABLE as TRADABLE_VENUES
 from app.models import Signal, SignalKind
+from app.flow import build_dots, read_flow, summarise as flow_summary, venue_split
 from app.portfolio import summary as portfolio_summary
 from app.runtime import Supervisor
 from app.predict import HORIZONS
@@ -39,7 +40,8 @@ from app.screener import (
 from app.screener import scan as scan_screener
 from app.storage import Store
 from app.strategies import REGISTRY
-from app.timeframes import TF_LABEL, TF_ORDER
+from app.tape import estimate_bars
+from app.timeframes import TF_LABEL, TF_ORDER, TF_SECONDS, resample
 
 logging.basicConfig(
     level=logging.INFO,
@@ -603,6 +605,102 @@ async def api_journal_write(body: JournalBody):
         if tr["id"] == body.fill_id:
             tr["journal"] = entry
     return {"ok": True, "entry": entry, "tags": robot.journal.tags()}
+
+
+FLOW_TFS = {"5s": 5, "15s": 15, "30s": 30, "1m": 60, "5m": 300, "15m": 900, "1h": 3600}
+
+
+def _flow_bars(sym: str, tf: str, want: int) -> tuple[list[dict], str]:
+    """Tape bars if the tape has them, candle-shape estimates otherwise."""
+    seconds = FLOW_TFS.get(tf, 60)
+    bars = hub.tape.bars(sym, seconds, want)
+    # a fresh symbol has no tape yet; a sub-minute timeframe cannot be faked
+    if len(bars) >= max(8, want // 6) or seconds < 60:
+        return bars, "tape"
+    win = hub.candles.get(sym)
+    if not win or not len(win):
+        return bars, "tape"
+    rows = resample(win, seconds) if seconds > 60 else [
+        {"ts": win.ts[i], "open": win.opens[i], "high": win.highs[i],
+         "low": win.lows[i], "close": win.closes[i], "volume": win.volumes[i]}
+        for i in range(len(win))
+    ]
+    est = estimate_bars(rows[-want:])
+    if not bars:
+        return est, "estimated"
+    # splice: estimated history in front of the real tape we do have
+    cutoff = bars[0]["ts"]
+    return [b for b in est if b["ts"] < cutoff] + bars, "mixed"
+
+
+@app.get("/api/flow/{symbol:path}")
+async def api_flow(
+    symbol: str,
+    tf: str = "1m",
+    bars: int = Query(180, ge=20, le=600),
+    venue: str = "",
+):
+    """Cross-exchange volume dots, cumulative delta and the order-flow read."""
+    sym = symbol.upper().replace("-", "/")
+    if "/" not in sym:
+        sym = f"{sym}/USDT"
+    tf = tf if tf in FLOW_TFS else "1m"
+    rows, source = _flow_bars(sym, tf, bars)
+    if venue:
+        keep = venue.lower()
+        rows = [_only_venue(b, keep) for b in rows]
+        rows = [b for b in rows if b["volume"] > 0]
+    built = build_dots(rows)
+    venues = venue_split(rows)
+    prints = hub.tape.big_prints(sym, 40)
+    if venue:
+        prints = [p for p in prints if p["venue"].lower() == venue.lower()]
+    t = hub.quote(sym)
+    return {
+        "symbol": sym,
+        "tf": tf,
+        "tf_seconds": FLOW_TFS[tf],
+        "source": source,
+        "simulated": bool(t and t.exchange == "sim") or any(v["venue"].startswith("sim") for v in venues),
+        "candles": [
+            {"ts": b["ts"], "open": b["open"], "high": b["high"], "low": b["low"],
+             "close": b["close"], "volume": b["volume"], "delta": b["delta"],
+             "buy_vol": b["buy_vol"], "sell_vol": b["sell_vol"], "estimated": b.get("estimated", False)}
+            for b in rows
+        ],
+        "dots": built["dots"],
+        "cvd": built["cvd"],
+        "levels": built["levels"],
+        "poc": built["poc"],
+        "venues": venues,
+        "prints": prints,
+        "summary": flow_summary(rows),
+        "read": read_flow(rows, built["dots"], built["cvd"], venues, prints),
+        "coverage": hub.tape.coverage(sym),
+        "quote": {"last": t.last, "change_pct": t.change_pct, "exchange": t.exchange} if t else None,
+        "timeframes": list(FLOW_TFS),
+        "watchlist": robot.watchlist,
+    }
+
+
+def _only_venue(bar: dict, venue: str) -> dict:
+    """Rebuild one bar from a single exchange's share of the flow."""
+    side = (bar.get("venues") or {}).get(venue) or {}
+    buy = float(side.get("buy") or 0.0)
+    sell = float(side.get("sell") or 0.0)
+    vol = buy + sell
+    out = dict(bar)
+    out.update({
+        "buy_vol": buy, "sell_vol": sell, "volume": vol, "delta": buy - sell,
+        "delta_pct": (buy - sell) / vol if vol else 0.0,
+        "venues": {venue: {"buy": buy, "sell": sell}} if vol else {},
+    })
+    return out
+
+
+@app.get("/api/tape/stats")
+async def api_tape_stats():
+    return {**hub.tape.stats(), "symbols_seen": hub.tape.symbols()[:200]}
 
 
 @app.get("/api/state")

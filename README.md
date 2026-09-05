@@ -15,6 +15,9 @@ A full trading terminal that:
 - **Predicts the next move** with a six-model ensemble: direction, probability, expected move, target, cone, S/R and a plain-English "why"
 - Runs a real **trade desk**: market/limit/stop/stop-limit/trailing orders, IOC/FOK/DAY, reduce-only,
   post-only, OCO brackets, a click-to-trade depth ladder and four sizing modes
+- Plots **volume dots** — a TradingView-style chart of the consolidated tape from every connected
+  exchange, one dot per bar sized by volume and coloured by buy/sell delta, with cumulative delta
+  and an order-flow read of the next move
 - Measures **portfolio risk**: exposure, concentration, correlation matrix, open risk, historical VaR
   and the R distribution of every closed trade
 - Fires **custom alert rules** (with cooldowns, auto-watch and webhooks)
@@ -70,6 +73,7 @@ Binance REST ─┘
                     │                   Supervisor (24/7 watchdog)
                     │
                     ├──► Portfolio risk (exposure, correlation, VaR, R)
+                    ├──► TapeBook (per-venue prints) → volume dots + flow read
                     ▼
               SQLite journal + FastAPI / WebSocket dashboard
 ```
@@ -418,6 +422,66 @@ order to a limit). Below it, the last fifteen closed trades with PnL and R.
 cancel one symbol's orders or the whole book, pause/resume the robot, or jump the desk to any
 watchlist coin.
 
+## Volume dots
+
+A candle tells you where price went. It does not tell you who moved it, whether the move was paid
+for, or whether the other side quietly took the whole thing. **Delta** — aggressive buying minus
+aggressive selling — does, and this view is built entirely on it.
+
+The chart is [lightweight-charts](https://github.com/tradingview/lightweight-charts) v5, **vendored
+into `web/vendor/`** rather than pulled from a CDN, so the dashboard still works on an air-gapped box.
+Three panes: candles with the dots on top, a delta histogram, and the cumulative delta line.
+
+### What a dot is
+
+Every dot is one bar of the **consolidated cross-exchange tape**:
+
+| Property | Meaning |
+|---|---|
+| position | the bar's volume-weighted price |
+| colour | green when buyers were the aggressors, red when sellers were |
+| size | total volume, graded against the rest of the window (1-5) |
+| opacity | how one-sided the flow was |
+| gold square | the bar disagrees with its own candle — absorption or divergence |
+
+The interesting dots are the ones that disagree with their candle. A red dot on a green bar means
+sellers hit every bid and price went **up** anyway: someone with size absorbed them. That is the
+signature that leads reversals, and it is what the read is looking for.
+
+Each bar is classified: `absorption` (heavy one-sided flow, no candle), `divergence` (aggressors on
+one side, price on the other), `initiative` (aggressors paid up and price followed), `pressure`,
+`thin` (price moved on almost no net flow — easy to reverse) and `balanced`.
+
+### The consolidated tape
+
+`app/tape.py` records **every print, per symbol, per venue**, bucketed into 5-second cells as it
+arrives so memory stays flat no matter how busy the tape gets — six hours of history per symbol.
+Any chart timeframe (5s to 1h) is a resample of those cells, so switching timeframes is free.
+
+Because the tape only starts when the robot does, older bars are estimated from candle shape — where
+the close sits in the bar's range is a decent proxy for who won it. Those bars are **flagged
+`estimated`** and the header says so; the read repeats the warning. Sub-minute timeframes never use
+the estimate, because you cannot fake a 15-second bar from a 1-minute candle.
+
+### The next-move read
+
+Eight weighted signals combine into a score from −100 to +100:
+
+1. **Delta tilt** — what share of the window's volume was aggressive, and on which side
+2. **Price vs cumulative-delta divergence** — the single most useful thing on the panel: price
+   grinding higher while CVD grinds lower means the rally is not being paid for
+3. **Absorption clusters** — repeated bars where one side kept hitting and price would not move
+4. **Initiative bars** — aggressors paid the spread and price followed
+5. **Cross-exchange agreement** — every venue net-buying is very different from one venue buying
+   while the rest sell; the biggest book gets the casting vote
+6. **Size prints** — the notional skew of outsized trades
+7. **Volume point of control** — whether price is accepted above or below where the volume traded
+8. **Climax exhaustion** — the biggest delta of the window producing almost no candle
+
+Every reason is shown with its weight and a plain-English explanation, so the score is auditable
+rather than a black box. The **By exchange** table breaks the same window down per venue, and the
+dropdown re-renders the entire chart from a single exchange's flow.
+
 ## Portfolio risk
 
 `GET /api/portfolio` and the **Risk & portfolio** view answer the questions that decide whether a
@@ -503,6 +567,8 @@ per-exit-reason and hourly edge tables, streaks, a PnL histogram and equity-curv
 | POST | `/api/orders/bracket` | attach a stop / target / trail to an open position |
 | GET | `/api/portfolio` | exposure, concentration, correlation, open risk, VaR, R distribution |
 | GET/POST | `/api/journal` | closed trades with annotations / tag, rate and note one |
+| GET | `/api/flow/{sym}?tf=&bars=&venue=` | volume dots, cumulative delta, per-venue split, flow read |
+| GET | `/api/tape/stats` | consolidated tape coverage: symbols, cells, prints, venues |
 
 ## Config
 
@@ -536,6 +602,13 @@ The terminal now includes:
 - **ATR stops**, **50% scale-out at 0.5R**, **BTC regime** (risk-on / risk-off size cut), **Kelly-ish sizing** after 8 trades
 - Click a strategy card to arm/disarm it live; **watch** a screener hit onto the sockets
 
+## Third-party assets
+
+`web/vendor/lightweight-charts.js` is TradingView's
+[lightweight-charts](https://github.com/tradingview/lightweight-charts) v5.2.1 standalone build,
+vendored so nothing is fetched from a CDN at runtime. Its Apache-2.0 licence is alongside it in
+`web/vendor/lightweight-charts.LICENSE`.
+
 ## Tests
 
 ```bash
@@ -543,7 +616,8 @@ pip install pytest
 pytest -q
 ```
 
-201 tests cover the indicator maths, rule frames, screener, builder specs, forecast scoring, the
+231 tests cover the indicator maths, rule frames, screener, builder specs, forecast scoring, the
 instrument universe, coin selection, the edge engine, credential storage, the supervisor, the order
-matcher (triggers, OCO, post-only, IOC, reduce-only, trailing ratchet, bracket arming) and the
-portfolio risk maths.
+matcher (triggers, OCO, post-only, IOC, reduce-only, trailing ratchet, bracket arming), the portfolio
+risk maths, and the tape and order-flow layer (cell bucketing, late prints, memory bounds,
+resampling, the candle-shape estimator, dot classification and every branch of the read).

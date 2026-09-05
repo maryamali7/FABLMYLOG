@@ -59,6 +59,7 @@
     document.querySelectorAll(".view").forEach((v) => v.classList.toggle("on", v.dataset.view === view));
     if (view === "desk") loadDesk();
     if (view === "risk") loadPortfolio();
+    if (view === "volume" && window.Flow) window.Flow.load();
     if (view === "journal") loadReview();
   }
 
@@ -584,6 +585,7 @@
     const sym = state.symbol;
     const list = [
       { k: "Go to trade desk", run: () => goto("desk") },
+      { k: "Go to volume dots", run: () => goto("volume") },
       { k: "Go to risk & portfolio", run: () => goto("risk") },
       { k: "Go to trade review", run: () => goto("journal") },
       { k: "Go to screener", run: () => goto("screeners") },
@@ -640,6 +642,17 @@
           state.symbol = s;
           $("dkSymbol").value = s;
           goto("desk");
+        },
+      });
+      list.push({
+        k: `Volume dots: ${s}`,
+        run: () => {
+          const box = document.getElementById("vdSymbol");
+          if (box) {
+            box.value = s;
+            box.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+          goto("volume");
         },
       });
     });
