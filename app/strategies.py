@@ -510,6 +510,19 @@ def ensemble(signals: list[Signal], min_confidence: float, min_votes: int = 2) -
         return None
     if conf < min_confidence:
         return None
+    winners = buys if kind == SignalKind.BUY else sells
+    extras: dict[str, Any] = {
+        "buy_score": buy_score,
+        "sell_score": sell_score,
+        "votes": votes,
+        "contributors": [s.strategy for s in winners[:8]],
+    }
+    # carry the leading signal's risk overrides (builder strategies set their own
+    # stop / target / trail) so custom money management survives the vote
+    for key in ("stop_loss_pct", "take_profit_pct", "trail_pct", "spec_id"):
+        value = (best.extras or {}).get(key)
+        if value:
+            extras[key] = value
     return Signal(
         strategy="ensemble",
         symbol=best.symbol,
@@ -518,5 +531,5 @@ def ensemble(signals: list[Signal], min_confidence: float, min_votes: int = 2) -
         price=best.price,
         reason=reason,
         ts=time.time(),
-        extras={"buy_score": buy_score, "sell_score": sell_score, "votes": votes},
+        extras=extras,
     )

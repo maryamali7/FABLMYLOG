@@ -7,18 +7,31 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, ORJSONResponse
+from fastapi.responses import FileResponse, ORJSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from app.alerts import ALERT_TEMPLATES
+from app.backtest import backtest, compare, portfolio_backtest
 from app.config import ROOT, load_settings
+from app.custom import TEMPLATES, template as custom_template, validate_spec
 from app.engine import Robot
 from app.market.hub import MarketHub
 from app.market.rest import fetch_klines, fetch_universe
+from app.rules import COMPARATORS, field_catalog
+from app.screener import (
+    BOARD_META,
+    DEFAULT_COLUMNS,
+    PRESETS,
+    rows_to_csv,
+    run_query,
+    summarize,
+)
 from app.screener import scan as scan_screener
 from app.storage import Store
+from app.strategies import REGISTRY
 
 logging.basicConfig(
     level=logging.INFO,
@@ -72,6 +85,7 @@ async def pulse() -> None:
                     "screener": robot.screener,
                     "regime": robot.regime,
                     "alerts": robot.alerts[:12],
+                    "rule_alerts": robot.rule_alerts[:12],
                     "ts": time.time(),
                 }
             )
@@ -306,6 +320,277 @@ async def api_manual(body: TradeBody):
         # temporarily size via notional by faking confidence if provided
         await robot._maybe_enter(sig, t)
     return {"ok": True}
+
+
+# --------------------------------------------------------------------------- #
+# strategy builder
+# --------------------------------------------------------------------------- #
+
+
+class SpecBody(BaseModel):
+    spec: dict[str, Any]
+
+
+class BacktestBody(BaseModel):
+    spec: dict[str, Any] | None = None
+    builtin: str | None = None
+    symbol: str = "BTC/USDT"
+    interval: str = "1m"
+    bars: int = 600
+    config: dict[str, Any] | None = None
+    symbols: list[str] | None = None
+    compare_with: list[str] | None = None
+
+
+class ScreenBody(BaseModel):
+    filters: Any = None
+    sort_by: str = "alpha"
+    sort_dir: str = "desc"
+    limit: int = 60
+    search: str = ""
+    preset: str | None = None
+    match: str = "all"
+
+
+class AlertBody(BaseModel):
+    spec: dict[str, Any]
+
+
+class RiskBody(BaseModel):
+    patch: dict[str, Any]
+
+
+@app.get("/api/builder/catalog")
+async def api_builder_catalog():
+    """Everything the visual builder needs to render: fields, operators, templates."""
+    return {
+        "fields": field_catalog(),
+        "comparators": [{"op": k, **v} for k, v in COMPARATORS.items()],
+        "group_ops": ["all", "any", "none"],
+        "templates": TEMPLATES,
+        "builtins": sorted(REGISTRY.keys()),
+        "alert_templates": ALERT_TEMPLATES,
+        "boards": BOARD_META,
+        "presets": PRESETS,
+        "columns": DEFAULT_COLUMNS,
+    }
+
+
+@app.get("/api/strategies/custom")
+async def api_custom_list():
+    return {"strategies": robot.custom.list()}
+
+
+@app.post("/api/strategies/custom")
+async def api_custom_save(body: SpecBody):
+    strat, errors = robot.save_custom(body.spec)
+    if errors:
+        return {"ok": False, "errors": errors}
+    await robot.emit("strategy_saved", {"id": strat.spec["id"], "name": strat.title})
+    return {"ok": True, "strategy": strat.to_dict()}
+
+
+@app.post("/api/strategies/custom/validate")
+async def api_custom_validate(body: SpecBody):
+    errors = validate_spec(body.spec)
+    if errors:
+        return {"ok": False, "errors": errors, "matches": []}
+    return robot.preview_custom(body.spec)
+
+
+@app.post("/api/strategies/custom/{spec_id}/toggle")
+async def api_custom_toggle(spec_id: str):
+    enabled = robot.toggle_custom(spec_id)
+    if enabled is None:
+        return {"ok": False, "error": "unknown strategy"}
+    return {"ok": True, "enabled": enabled}
+
+
+@app.post("/api/strategies/custom/{spec_id}/duplicate")
+async def api_custom_duplicate(spec_id: str):
+    strat = robot.custom.duplicate(spec_id)
+    if not strat:
+        return {"ok": False, "error": "unknown strategy"}
+    robot.refresh_strategies()
+    return {"ok": True, "strategy": strat.to_dict()}
+
+
+@app.delete("/api/strategies/custom/{spec_id}")
+async def api_custom_delete(spec_id: str):
+    return {"ok": robot.delete_custom(spec_id)}
+
+
+@app.get("/api/strategies/templates")
+async def api_templates(template_id: str | None = None):
+    if template_id:
+        spec = custom_template(template_id)
+        return {"ok": bool(spec), "spec": spec}
+    return {"templates": TEMPLATES}
+
+
+async def _candles_for(symbol: str, interval: str, bars: int):
+    """Prefer live hub candles, fall back to REST history (and back again)."""
+    sym = symbol.upper().replace("-", "/")
+    win = hub.candles.get(sym)
+    if win and len(win) >= max(120, bars) and interval == settings.candle_interval:
+        return win
+    try:
+        rows = await fetch_klines(sym, interval, min(max(bars, 120), 1000))
+        if rows:
+            return rows
+    except Exception as exc:
+        log.debug("kline fetch %s: %s", sym, exc)
+    if win and len(win) >= 70:
+        return win
+    raise RuntimeError(f"no candle history available for {sym} yet — let the feed warm up")
+
+
+@app.post("/api/backtest")
+async def api_backtest(body: BacktestBody):
+    try:
+        if body.symbols:
+            series = {}
+            for sym in body.symbols[:8]:
+                series[sym.upper().replace("-", "/")] = await _candles_for(sym, body.interval, body.bars)
+            return portfolio_backtest(series, spec=body.spec, builtin=body.builtin, config=body.config)
+        candles = await _candles_for(body.symbol, body.interval, body.bars)
+        result = backtest(
+            candles,
+            spec=body.spec,
+            builtin=body.builtin,
+            symbol=body.symbol.upper().replace("-", "/"),
+            config=body.config,
+        )
+        if body.compare_with:
+            result["comparison"] = compare(
+                candles, list(body.compare_with)[:6], body.symbol, body.config
+            )
+        return result
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "metrics": {}}
+
+
+# --------------------------------------------------------------------------- #
+# advanced screener
+# --------------------------------------------------------------------------- #
+
+
+def _screener_rows() -> list[dict[str, Any]]:
+    if not robot.screener:
+        robot.screener = scan_screener(hub, robot.watchlist)
+    return (robot.screener or {}).get("rows") or []
+
+
+@app.post("/api/screener/query")
+async def api_screener_query(body: ScreenBody):
+    rows = _screener_rows()
+    result = run_query(
+        rows,
+        filters=body.filters,
+        sort_by=body.sort_by,
+        sort_dir=body.sort_dir,
+        limit=body.limit,
+        search=body.search,
+        preset_id=body.preset,
+        match=body.match,
+    )
+    result["summary"] = summarize(rows)
+    result["scanned"] = len(rows)
+    return result
+
+
+@app.get("/api/screener/presets")
+async def api_screener_presets():
+    return {"presets": PRESETS, "columns": DEFAULT_COLUMNS, "boards": BOARD_META}
+
+
+@app.get("/api/screener/export.csv")
+async def api_screener_export(board: str = "", preset: str = "", limit: int = 200):
+    rows = _screener_rows()
+    if board:
+        rows = ((robot.screener or {}).get("boards") or {}).get(board) or []
+    elif preset:
+        rows = run_query(rows, preset_id=preset, limit=limit)["rows"]
+    csv_text = rows_to_csv(rows[:limit])
+    return PlainTextResponse(
+        csv_text,
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=fablmylog-screener.csv"},
+    )
+
+
+@app.get("/api/screener/symbol/{symbol:path}")
+async def api_screener_symbol(symbol: str):
+    sym = symbol.upper().replace("-", "/")
+    for row in _screener_rows():
+        if row.get("symbol") == sym:
+            return row
+    return {"error": "symbol not scanned", "symbol": sym}
+
+
+# --------------------------------------------------------------------------- #
+# alert rules
+# --------------------------------------------------------------------------- #
+
+
+@app.get("/api/alerts/rules")
+async def api_alert_rules():
+    return {"rules": robot.alert_engine.list(), "templates": ALERT_TEMPLATES}
+
+
+@app.post("/api/alerts/rules")
+async def api_alert_save(body: AlertBody):
+    rule, errors = robot.alert_engine.upsert(body.spec)
+    if errors:
+        return {"ok": False, "errors": errors}
+    return {"ok": True, "rule": rule}
+
+
+@app.post("/api/alerts/rules/{rule_id}/toggle")
+async def api_alert_toggle(rule_id: str):
+    enabled = robot.alert_engine.toggle(rule_id)
+    if enabled is None:
+        return {"ok": False, "error": "unknown rule"}
+    return {"ok": True, "enabled": enabled}
+
+
+@app.delete("/api/alerts/rules/{rule_id}")
+async def api_alert_delete(rule_id: str):
+    return {"ok": robot.alert_engine.delete(rule_id)}
+
+
+@app.get("/api/alerts/history")
+async def api_alert_history(limit: int = Query(40, ge=1, le=200)):
+    return {"alerts": robot.alert_engine.recent(limit), "feed": robot.rule_alerts[:limit]}
+
+
+# --------------------------------------------------------------------------- #
+# analytics + risk
+# --------------------------------------------------------------------------- #
+
+
+@app.get("/api/analytics")
+async def api_analytics():
+    return await robot.analytics()
+
+
+@app.get("/api/risk")
+async def api_risk_get():
+    return {"risk": settings.risk.model_dump(), "halted": robot.risk.halted, "reason": robot.risk.halt_reason}
+
+
+@app.post("/api/risk")
+async def api_risk_set(body: RiskBody):
+    applied = robot.update_risk(body.patch)
+    await robot.emit("risk", applied)
+    return {"ok": True, "applied": applied, "risk": settings.risk.model_dump()}
+
+
+@app.post("/api/risk/resume")
+async def api_risk_resume():
+    robot.risk.reset_day(robot.mark_equity)
+    await robot.emit("risk_reset", {"equity": robot.mark_equity})
+    return {"ok": True, "halted": robot.risk.halted}
 
 
 @app.websocket("/ws")

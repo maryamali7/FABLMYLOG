@@ -6,12 +6,16 @@ import time
 import uuid
 from typing import Any
 
+from app.alerts import AlertEngine
+from app.analytics import analyze
 from app.config import Settings, has_live_keys
+from app.custom import CustomRegistry
 from app.indicators import atr, ema, roc
 from app.market.hub import MarketHub
 from app.market.rest import fetch_klines, fetch_universe, ping_exchanges
 from app.models import Fill, Position, Side, Signal, SignalKind, Ticker
 from app.screener import scan as scan_screener
+from app.rules import FRAMES
 from app.storage import Store
 from app.strategies import build_strategies, ensemble
 
@@ -78,7 +82,11 @@ class Robot:
         self.store = store
         self.hub = hub
         self.risk = RiskGate(settings)
-        self.strategies = build_strategies(settings.strategies)
+        self.builtins = build_strategies(settings.strategies)
+        self.custom = CustomRegistry()
+        self.alert_engine = AlertEngine()
+        self.strategies: list[Any] = []
+        self.refresh_strategies()
         self.cash = settings.starting_equity
         self.positions: dict[str, Position] = {}
         self.signals: list[dict[str, Any]] = []
@@ -101,6 +109,12 @@ class Robot:
         self.alerts: list[dict[str, Any]] = []
         self.strategy_pnl: dict[str, float] = {}
         self.regime: dict[str, Any] = {"name": "unknown", "risk_on": True}
+        self.rule_alerts: list[dict[str, Any]] = []
+        self.last_scan_rows: list[dict[str, Any]] = []
+
+    def refresh_strategies(self) -> None:
+        """Built-ins + everything created in the strategy builder."""
+        self.strategies = [*self.builtins, *self.custom.all()]
 
     def bind_broadcast(self, fn) -> None:
         self._broadcast = fn
@@ -215,9 +229,11 @@ class Robot:
         if self.loops % 2 == 0:
             try:
                 self.screener = scan_screener(self.hub, self.watchlist)
+                self.last_scan_rows = self.screener.get("rows") or []
                 for a in self.screener.get("alerts") or []:
                     self.alerts.insert(0, a)
                 self.alerts = self.alerts[:40]
+                await self._run_alert_rules(self.last_scan_rows)
             except Exception as exc:
                 log.debug("screener: %s", exc)
 
@@ -273,8 +289,11 @@ class Robot:
         if self.cash < notional + fee:
             return
         qty = notional / px
-        stop = px * (1 - self.settings.risk.stop_loss_pct)
-        take = px * (1 + self.settings.risk.take_profit_pct)
+        extras = sig.extras or {}
+        stop_pct = float(extras.get("stop_loss_pct") or self.settings.risk.stop_loss_pct)
+        take_pct = float(extras.get("take_profit_pct") or self.settings.risk.take_profit_pct)
+        stop = px * (1 - stop_pct)
+        take = px * (1 + take_pct)
         atr_val = 0.0
         win = self.hub.candles.get(sig.symbol)
         if win and len(win) >= 20:
@@ -296,6 +315,9 @@ class Robot:
             exchange=t.exchange,
             peak=px,
             atr=atr_val,
+            trail_pct=float(extras.get("trail_pct") or 0.0),
+            spec_id=str(extras.get("spec_id") or ""),
+            confidence=round(float(sig.confidence), 3),
         )
         self.cash -= notional + fee
         self.positions[sig.symbol] = pos
@@ -340,7 +362,8 @@ class Robot:
         pos.unrealized = self._mtm(pos)
         if pos.side == Side.BUY:
             pos.peak = max(pos.peak, px)
-            trail_stop = pos.peak * (1 - self.settings.risk.trailing_stop_pct)
+            trail_pct = pos.trail_pct or self.settings.risk.trailing_stop_pct
+            trail_stop = pos.peak * (1 - trail_pct)
             if pos.atr:
                 trail_stop = max(trail_stop, pos.peak - 1.2 * pos.atr)
             pos.trail = max(pos.stop, trail_stop)
@@ -425,6 +448,124 @@ class Robot:
         await self.store.add_fill(fill)
         await self.emit("fill", {**fill.to_dict(), "pnl": pnl, "partial": True})
 
+    async def _run_alert_rules(self, rows: list[dict[str, Any]]) -> None:
+        """Evaluate user alert rules against the freshest screener rows."""
+        if not rows or not self.alert_engine.rules:
+            return
+        try:
+            fired = self.alert_engine.evaluate(rows)
+        except Exception as exc:
+            log.debug("alert rules: %s", exc)
+            return
+        watch_extra: list[str] = []
+        for event in fired:
+            self.rule_alerts.insert(0, event)
+            self.alerts.insert(0, {"ts": event["ts"], "kind": "rule", "symbol": event["symbol"], "text": event["text"]})
+            await self.emit("alert", {k: event[k] for k in ("rule", "symbol", "severity", "text")})
+            if event.get("auto_watch") and event["symbol"] not in self.watchlist:
+                watch_extra.append(event["symbol"])
+            if event.get("webhook"):
+                asyncio.create_task(self._post_webhook(event["webhook"], event))
+        self.rule_alerts = self.rule_alerts[:60]
+        self.alerts = self.alerts[:40]
+        if watch_extra:
+            await self.set_watchlist([*self.watchlist, *watch_extra])
+
+    async def _post_webhook(self, url: str, event: dict[str, Any]) -> None:
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=6) as client:
+                await client.post(url, json={k: v for k, v in event.items() if k != "webhook"})
+        except Exception as exc:
+            log.debug("webhook %s: %s", url, exc)
+
+    # ---- builder / risk plumbing ---------------------------------------- #
+
+    def save_custom(self, spec: dict[str, Any]):
+        strat, errors = self.custom.upsert(spec)
+        if strat:
+            self.refresh_strategies()
+        return strat, errors
+
+    def delete_custom(self, spec_id: str) -> bool:
+        ok = self.custom.delete(spec_id)
+        if ok:
+            self.refresh_strategies()
+        return ok
+
+    def toggle_custom(self, spec_id: str, enabled: bool | None = None) -> bool | None:
+        out = self.custom.toggle(spec_id, enabled)
+        if out is not None:
+            self.refresh_strategies()
+        return out
+
+    def preview_custom(self, spec: dict[str, Any], limit: int = 25) -> dict[str, Any]:
+        """Dry-run a builder spec across the watchlist without trading it."""
+        from app.custom import CustomStrategy, validate_spec
+
+        errors = validate_spec(spec)
+        if errors:
+            return {"ok": False, "errors": errors, "matches": []}
+        probe = CustomStrategy({**spec, "enabled": True, "cooldown_sec": 0})
+        matches: list[dict[str, Any]] = []
+        checked = 0
+        for sym in self.watchlist[:limit]:
+            win = self.hub.candles.get(sym)
+            t = self.hub.quote(sym)
+            if not win or len(win) < 40:
+                continue
+            checked += 1
+            price = t.last if t else float(win.closes[-1])
+            try:
+                sig = probe.evaluate(sym, win, price)
+            except Exception as exc:
+                return {"ok": False, "errors": [f"{sym}: {exc}"], "matches": []}
+            if sig:
+                matches.append(
+                    {
+                        "symbol": sym,
+                        "kind": sig.kind.value,
+                        "confidence": round(sig.confidence, 3),
+                        "price": price,
+                        "reason": sig.reason,
+                        "trace": (sig.extras or {}).get("trace", []),
+                    }
+                )
+        trace = probe.last_trace.get("entry", []) if probe.last_trace else []
+        return {
+            "ok": True,
+            "errors": [],
+            "checked": checked,
+            "matches": matches,
+            "sample_trace": trace[:10],
+        }
+
+    def update_risk(self, patch: dict[str, Any]) -> dict[str, Any]:
+        """Live-tune the risk gate from the dashboard."""
+        cfg = self.settings.risk
+        applied: dict[str, Any] = {}
+        for key, value in (patch or {}).items():
+            if not hasattr(cfg, key) or value is None:
+                continue
+            try:
+                current = getattr(cfg, key)
+                cast = type(current)(value) if not isinstance(current, bool) else bool(value)
+            except (TypeError, ValueError):
+                continue
+            setattr(cfg, key, cast)
+            applied[key] = cast
+        self.risk.cfg = cfg
+        return applied
+
+    async def analytics(self) -> dict[str, Any]:
+        fills = await self.store.recent_fills(500)
+        equity = await self.store.equity_series(500)
+        data = analyze(fills, equity)
+        data["strategy_pnl"] = self.strategy_pnl
+        data["open_positions"] = len(self.positions)
+        return data
+
     def _compute_regime(self) -> dict[str, Any]:
         win = self.hub.candles.get("BTC/USDT")
         if not win or len(win) < 30:
@@ -445,6 +586,8 @@ class Robot:
         }
 
     def toggle_strategy(self, name: str, enabled: bool | None = None) -> bool | None:
+        if name in self.custom.strategies:
+            return self.toggle_custom(name, enabled)
         for s in self.strategies:
             if s.name == name:
                 s.enabled = (not s.enabled) if enabled is None else bool(enabled)
@@ -523,10 +666,17 @@ class Robot:
                     "family": getattr(s, "family", "core"),
                     "weight": s.weight,
                     "enabled": s.enabled,
+                    "custom": bool(getattr(s, "custom", False)),
+                    "fires": int(getattr(s, "fires", 0)),
                     "pnl": self.strategy_pnl.get(s.name, 0.0),
                 }
                 for s in self.strategies
             ],
+            "custom_strategies": self.custom.list(),
+            "alert_rules": self.alert_engine.list(),
+            "rule_alerts": self.rule_alerts[:12],
+            "screener_summary": (self.screener or {}).get("summary", {}),
+            "frame_cache": {"hits": FRAMES.hits, "misses": FRAMES.misses},
             "risk": self.settings.risk.model_dump(),
             "feeds": self.hub.health(),
             "rest_ok": self.rest_ok,
