@@ -23,6 +23,7 @@ from app.predict import rank_forecasts
 from app.rules import FRAMES
 from app.storage import Store
 from app.timeframes import MTFEngine
+from app.universe import Universe
 from app.strategies import build_strategies, ensemble
 
 log = logging.getLogger("engine")
@@ -127,6 +128,7 @@ class Robot:
         self._forecast_cursor = 0
         self.loop_ms = 0.0
         self.tracker = ForecastTracker(ROOT / "data" / "forecast_log.json")
+        self.instruments = Universe()
         set_context_provider(self.symbol_context)
 
     def refresh_strategies(self) -> None:
@@ -200,6 +202,7 @@ class Robot:
                 await self.mtf.refresh_symbol(sym)
             except Exception as exc:
                 log.debug("mtf prime %s: %s", sym, exc)
+        asyncio.create_task(self._load_instruments())
         if not self.tracker.settled:
             asyncio.create_task(self.backfill_scoreboard())
         self.risk.day_start_equity = self.mark_equity
@@ -258,6 +261,8 @@ class Robot:
             await self._manage_position(sym)
 
         self.regime = self._compute_regime()
+        if self.loops % 150 == 0 and self.instruments.stale and not self.instruments.loading:
+            asyncio.create_task(self._load_instruments())
         try:
             await self.mtf.refresh_next(self.watchlist, batch=2)
         except Exception as exc:
@@ -581,6 +586,42 @@ class Robot:
             log.info("forecast scoreboard seeded with %d graded historical calls", graded)
         return graded
 
+    async def _load_instruments(self) -> None:
+        """Pull every venue catalog (spot + futures) in the background."""
+        try:
+            report = await self.instruments.refresh()
+        except Exception as exc:
+            log.debug("instrument catalog: %s", exc)
+            return
+        if report.get("count"):
+            await self.emit(
+                "universe",
+                {
+                    "count": report.get("count"),
+                    "source": report.get("source"),
+                    "venues": len(report.get("ok") or []),
+                },
+            )
+            # keep the legacy single-venue universe list in sync for the search box
+            top = self.instruments.query(market="spot", quote=self.settings.quote_asset, limit=400)
+            self.universe = [
+                {
+                    "symbol": r["symbol"],
+                    "last": r["last"],
+                    "change_pct": r["change_pct"],
+                    "volume": r["volume_usd"],
+                    "venue": r["venue"],
+                    "market": r["market"],
+                }
+                for r in top["rows"]
+            ] or self.universe
+
+    async def add_symbols(self, symbols: list[str]) -> list[str]:
+        """Append instruments to the live watchlist (deduped, capped)."""
+        merged = list(dict.fromkeys([*self.watchlist, *[s.upper().replace("-", "/") for s in symbols]]))
+        await self.set_watchlist(merged)
+        return self.watchlist
+
     def _forecast_score(self) -> dict[str, Any]:
         """Small scoreboard summary for the live snapshot."""
         st = self.tracker
@@ -899,6 +940,11 @@ class Robot:
             },
             "forecasts_cached": len(self.forecasts),
             "forecast_score": self._forecast_score(),
+            "instruments": {
+                "count": len(self.instruments.rows),
+                "source": self.instruments.report.get("source", "none"),
+                "venues": len(self.instruments.report.get("ok") or []),
+            },
             "loop_ms": self.loop_ms,
             "frame_cache": {"hits": FRAMES.hits, "misses": FRAMES.misses},
             "risk": self.settings.risk.model_dump(),

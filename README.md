@@ -52,6 +52,8 @@ Binance REST ─┘
         ▼                        ▼
   MTFEngine (1m…1w)        Rule frames / screener
         │                        │
+  Universe index ── Binance / Bybit / OKX / MEXC · spot + futures catalogs
+        │                        │
         └────────► Forecast ensemble (6 models)
                     │
                     ▼
@@ -195,6 +197,38 @@ The backtester rebuilds the higher timeframes from the same candles and replays 
 without look-ahead. Results list which frames were replayed, and warn when a rule uses a
 live-only forecast field that cannot be simulated.
 
+## Instrument universe (Binance · Bybit · OKX · MEXC)
+
+The **Universe** view indexes *every* instrument on four venues — spot **and** futures — from
+their public, key-free ticker endpoints:
+
+| Venue | Spot | Futures |
+|---|---|---|
+| Binance | `api/v3/ticker/24hr` | `fapi/v1/ticker/24hr` + `premiumIndex` (funding) |
+| Bybit | `v5/market/tickers?category=spot` | `category=linear` (funding, open interest) |
+| OKX | `v5/market/tickers?instType=SPOT` | `instType=SWAP` + `public/open-interest` |
+| MEXC | `api/v3/ticker/24hr` | `contract/api/v1/contract/ticker` (funding, holdVol) |
+
+Everything is normalized into one row shape (`venue`, `market`, `symbol`, `base`, `quote`,
+`last`, `change_pct`, `volume_usd`, `funding_rate`, `open_interest`, `contract`, `source`) and
+indexed in memory with a 15-minute TTL refresh, so the browser can:
+
+- **filter** by venue chips, market type (spot / perps), quote asset, minimum volume and free text;
+- **sort** by volume, gainers, losers, funding, open interest or price;
+- flip to **per-coin mode**, which merges every listing of an asset and shows how many venues
+  list it, spot vs perp coverage, aggregate volume and the cross-venue price spread;
+- read the **cross-venue spread** board (cheapest venue vs richest venue for the same coin) and
+  the **funding & basis** board (who pays funding, funding APR, perp premium/discount to spot);
+- **watch** any instrument — one click appends it to the live watchlist, capped by
+  `max_watch_symbols`;
+- export the current filter to CSV.
+
+If every venue is unreachable (air-gapped host, blocked TLS, exchange outage) the index falls
+back to a bundled offline catalog with **simulated prices**. Those rows are tagged
+`source: "offline"` and the UI shows a red banner saying so — simulated data is never presented
+as market data. A partial success is never overwritten: if three catalogs load and one fails,
+you get the three plus a listed failure.
+
 ## Alert rules & analytics
 
 Alert rules reuse the same rule engine against screener rows, with severity, message
@@ -224,6 +258,15 @@ per-exit-reason and hourly edge tables, streaks, a PnL histogram and equity-curv
 | GET | `/api/forecasts` · `/api/levels/{sym}` | ranked forecasts, support/resistance |
 | GET | `/api/forecasts/accuracy` | hit rate, Brier, calibration, per-model scoring |
 | POST | `/api/forecasts/backfill` | re-seed the scoreboard from candle history |
+| GET | `/api/instruments` | every venue/market listing, filtered + sorted + paged |
+| GET | `/api/instruments/stats` | per-venue counts, coins, volume, catalog source |
+| GET | `/api/instruments/coins` | one row per coin, merged across venues |
+| GET | `/api/instruments/arb` | widest cross-venue price gaps |
+| GET | `/api/instruments/funding` | funding extremes + perp-vs-spot basis |
+| GET | `/api/instruments/symbol/{sym}` | every listing of one symbol |
+| GET | `/api/instruments/export.csv` | CSV of the current filter |
+| POST | `/api/instruments/refresh` | re-pull catalogs (optionally one venue/market) |
+| POST | `/api/instruments/watch` | add instruments to the live watchlist |
 
 ## Config
 

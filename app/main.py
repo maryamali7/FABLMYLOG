@@ -20,6 +20,7 @@ from app.custom import TEMPLATES, template as custom_template, validate_spec
 from app.engine import Robot
 from app.market.hub import MarketHub
 from app.market.rest import fetch_klines, fetch_universe
+from app.market.venues import MARKETS, VENUES
 from app.predict import HORIZONS
 from app.rules import COMPARATORS, field_catalog
 from app.screener import (
@@ -148,13 +149,161 @@ async def api_tickers():
 
 @app.get("/api/universe")
 async def api_universe(limit: int = 200):
+    """Legacy flat list (spot pairs on the configured quote asset)."""
     if robot.universe:
         return robot.universe[:limit]
+    if robot.instruments.rows:
+        page = robot.instruments.query(market="spot", quote=settings.quote_asset, limit=limit)
+        return [
+            {
+                "symbol": r["symbol"],
+                "last": r["last"],
+                "change_pct": r["change_pct"],
+                "volume": r["volume_usd"],
+                "venue": r["venue"],
+            }
+            for r in page["rows"]
+        ]
     try:
         robot.universe = await fetch_universe(settings.quote_asset, 400)
     except Exception as exc:
         return {"error": str(exc), "rows": []}
     return robot.universe[:limit]
+
+
+class InstrumentWatchBody(BaseModel):
+    symbol: str | None = None
+    symbols: list[str] = []
+
+
+# --------------------------------------------------------------------------- #
+# multi-venue instrument universe (binance / bybit / okx / mexc · spot + perp)
+# --------------------------------------------------------------------------- #
+
+
+@app.get("/api/instruments")
+async def api_instruments(
+    venue: str = "",
+    market: str = "",
+    quote: str = "",
+    search: str = "",
+    sort: str = "volume",
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    min_volume: float = 0.0,
+):
+    """Every listed instrument across venues and market types."""
+    if robot.instruments.stale and not robot.instruments.loading:
+        await robot.instruments.refresh()
+    return robot.instruments.query(
+        venue=venue,
+        market=market,
+        quote=quote,
+        search=search,
+        sort=sort,
+        limit=limit,
+        offset=offset,
+        min_volume=min_volume,
+    )
+
+
+@app.get("/api/instruments/stats")
+async def api_instruments_stats():
+    if robot.instruments.stale and not robot.instruments.loading:
+        await robot.instruments.refresh()
+    return robot.instruments.stats()
+
+
+@app.post("/api/instruments/refresh")
+async def api_instruments_refresh(venue: str = "", market: str = ""):
+    venues = [v for v in venue.split(",") if v] or list(VENUES)
+    markets = [m for m in market.split(",") if m] or list(MARKETS)
+    report = await robot.instruments.refresh(venues, markets, force=True)
+    return {"ok": True, "report": report, "stats": robot.instruments.stats()}
+
+
+@app.get("/api/instruments/coins")
+async def api_instruments_coins(
+    quote: str = "USDT",
+    limit: int = Query(100, ge=1, le=500),
+    min_venues: int = Query(1, ge=1, le=8),
+):
+    """One row per coin, merged across every venue and market."""
+    if robot.instruments.stale and not robot.instruments.loading:
+        await robot.instruments.refresh()
+    return {
+        "rows": robot.instruments.coins(quote=quote, limit=limit, min_venues=min_venues),
+        "source": robot.instruments.report.get("source"),
+    }
+
+
+@app.get("/api/instruments/arb")
+async def api_instruments_arb(
+    quote: str = "USDT",
+    market: str = "spot",
+    limit: int = Query(20, ge=1, le=100),
+    min_volume: float = 1e6,
+):
+    return {
+        "rows": robot.instruments.arbitrage(quote=quote, market=market, limit=limit, min_volume=min_volume),
+        "source": robot.instruments.report.get("source"),
+    }
+
+
+@app.get("/api/instruments/funding")
+async def api_instruments_funding(
+    quote: str = "USDT", limit: int = Query(15, ge=1, le=100), min_volume: float = 1e6
+):
+    return robot.instruments.funding(quote=quote, limit=limit, min_volume=min_volume)
+
+
+@app.get("/api/instruments/symbol/{symbol:path}")
+async def api_instrument_detail(symbol: str):
+    """Every venue/market listing for one symbol, with the cross-venue spread."""
+    rows = robot.instruments.find(symbol)
+    prices = [r["last"] for r in rows if r["last"] > 0]
+    return {
+        "symbol": symbol.upper().replace("-", "/"),
+        "listings": rows,
+        "venues": sorted({r["venue"] for r in rows}),
+        "markets": sorted({r["market"] for r in rows}),
+        "spread_pct": round((max(prices) / min(prices) - 1) * 100, 4) if len(prices) > 1 else 0.0,
+        "in_watchlist": symbol.upper().replace("-", "/") in robot.watchlist,
+    }
+
+
+@app.get("/api/instruments/export.csv")
+async def api_instruments_csv(
+    venue: str = "", market: str = "", quote: str = "", search: str = "", limit: int = Query(500, ge=1, le=5000)
+):
+    page = robot.instruments.query(
+        venue=venue, market=market, quote=quote, search=search, limit=limit
+    )
+    return PlainTextResponse(
+        robot.instruments.to_csv(page["rows"]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=fablmylog-instruments.csv"},
+    )
+
+
+@app.post("/api/instruments/watch")
+async def api_instruments_watch(body: InstrumentWatchBody):
+    """Add instruments from the universe browser to the live watchlist."""
+    symbols = [s for s in (body.symbols or []) if s]
+    if body.symbol:
+        symbols.append(body.symbol)
+    if not symbols:
+        return {"ok": False, "error": "no symbols given", "watchlist": robot.watchlist}
+    before = set(robot.watchlist)
+    watchlist = await robot.add_symbols(symbols)
+    added = [s for s in watchlist if s not in before]
+    return {
+        "ok": True,
+        "added": added,
+        "skipped": [s.upper().replace("-", "/") for s in symbols if s.upper().replace("-", "/") not in watchlist],
+        "watchlist": watchlist,
+        "cap": settings.max_watch_symbols,
+    }
 
 
 @app.get("/api/candles/{symbol:path}")

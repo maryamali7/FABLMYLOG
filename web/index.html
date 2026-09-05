@@ -24,6 +24,7 @@
         <button class="nav on" data-view="overview">Overview</button>
         <button class="nav" data-view="trade">Trade</button>
         <button class="nav" data-view="markets">Markets</button>
+        <button class="nav" data-view="universe">Universe</button>
         <button class="nav" data-view="screeners">Screener Pro</button>
         <button class="nav" data-view="mtf">Multi-TF &amp; forecast</button>
         <button class="nav" data-view="builder">Strategy builder</button>
@@ -140,6 +141,106 @@
         <div class="card" style="margin-top:16px">
           <div class="card-h"><h2>Print tape</h2></div>
           <div id="tape" class="list tape"></div>
+        </div>
+      </section>
+
+      <!-- ================= MULTI-VENUE UNIVERSE ================= -->
+      <section class="view" data-view="universe">
+        <div class="card">
+          <div class="card-h">
+            <div>
+              <h2>Instrument universe</h2>
+              <p class="sub" id="uniMeta">Binance · Bybit · OKX · MEXC — spot and futures</p>
+            </div>
+            <div class="row-btns">
+              <button class="btn tiny" id="uniReload">Refresh catalogs</button>
+              <button class="btn tiny" id="uniCsv">Export CSV</button>
+            </div>
+          </div>
+          <div id="uniBanner"></div>
+          <div class="metric-grid" id="uniStats"></div>
+          <div class="table-wrap venue-table">
+            <table class="data">
+              <thead><tr><th>Venue</th><th>Spot</th><th>Futures</th><th>Total</th><th>Coins</th><th>24h volume</th></tr></thead>
+              <tbody id="uniVenues"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-h">
+            <div><h2>Browse</h2><p class="sub" id="uniCount">—</p></div>
+            <div class="row-btns">
+              <button class="btn tiny" id="uniWatchTop">Watch top 5</button>
+            </div>
+          </div>
+          <div class="chips" id="uniVenueChips"></div>
+          <div class="chips" id="uniMarketChips"></div>
+          <div class="filter-bar">
+            <input id="uniSearch" class="mini" placeholder="Search coin or pair…" />
+            <select id="uniQuote" class="mini">
+              <option value="">Any quote</option>
+              <option value="USDT" selected>USDT</option>
+              <option value="USDC">USDC</option>
+              <option value="BTC">BTC</option>
+              <option value="ETH">ETH</option>
+            </select>
+            <select id="uniSort" class="mini">
+              <option value="volume">Volume</option>
+              <option value="change">Top gainers</option>
+              <option value="losers">Top losers</option>
+              <option value="funding">Funding</option>
+              <option value="open_interest">Open interest</option>
+              <option value="price">Price</option>
+              <option value="symbol">Symbol</option>
+            </select>
+            <select id="uniMode" class="mini">
+              <option value="instruments">Per listing</option>
+              <option value="coins">Per coin</option>
+            </select>
+            <input id="uniLimit" class="mini tiny-num" type="number" value="60" min="10" max="500" />
+          </div>
+          <div class="table-wrap">
+            <table class="data">
+              <thead><tr id="uniHead"></tr></thead>
+              <tbody id="uniBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="fc-grid">
+          <div class="card">
+            <div class="card-h">
+              <div><h2>Cross-venue spread</h2><p class="sub">Same coin, different price — widest gaps first</p></div>
+              <select id="uniArbMarket" class="mini">
+                <option value="spot">Spot</option>
+                <option value="futures">Futures</option>
+              </select>
+            </div>
+            <div class="table-wrap">
+              <table class="data">
+                <thead><tr><th>Coin</th><th>Buy</th><th>Sell</th><th>Spread</th><th>Venues</th></tr></thead>
+                <tbody id="uniArb"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-h">
+              <div><h2>Funding &amp; basis</h2><p class="sub">Perp funding extremes and premium to spot</p></div>
+              <select id="uniFundSide" class="mini">
+                <option value="longs_pay">Longs pay</option>
+                <option value="shorts_pay">Shorts pay</option>
+                <option value="premium">Premium to spot</option>
+                <option value="discount">Discount to spot</option>
+              </select>
+            </div>
+            <div class="table-wrap">
+              <table class="data">
+                <thead><tr><th>Perp</th><th>Venue</th><th>Funding</th><th>APR</th><th>Basis</th></tr></thead>
+                <tbody id="uniFunding"></tbody>
+              </table>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -543,5 +644,6 @@
   <script src="/static/app.js"></script>
   <script src="/static/pro.js"></script>
   <script src="/static/mtf.js"></script>
+  <script src="/static/universe.js"></script>
 </body>
 </html>
