@@ -38,6 +38,8 @@ const SCN_COLS = [
   { k: "risk_score", l: "Risk", t: "n1" },
   { k: "signal_count", l: "Conf", t: "n0" },
   { k: "rs_btc", l: "vs BTC", t: "signed" },
+  { k: "mtf_score", l: "MTF", t: "signed" },
+  { k: "prob_up", l: "P(up)", t: "n1" },
   { k: "bias", l: "Bias", t: "bias" },
 ];
 

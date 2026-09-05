@@ -287,8 +287,47 @@ def build_boards(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
             if r.get("squeeze") and g(r, "adx") < 20 and abs(g(r, "bb_pct", 0.5) - 0.5) < 0.35
         ][:12],
         "liquid": _top(rows, "liquidity", 12),
+        # ---- multi-timeframe + forecast boards
+        "mtf_bull": [
+            r
+            for r in _top(rows, "mtf_score", 25)
+            if g(r, "mtf_score") >= 35 and g(r, "mtf_agreement") >= 60 and g(r, "mtf_timeframes") >= 3
+        ][:12],
+        "mtf_bear": [
+            r
+            for r in _top(rows, "mtf_score", 25, reverse=False)
+            if g(r, "mtf_score") <= -35 and g(r, "mtf_agreement") >= 60 and g(r, "mtf_timeframes") >= 3
+        ][:12],
+        "mtf_conflict": [
+            r
+            for r in rows
+            if g(r, "mtf_timeframes") >= 3
+            and g(r, "mtf_agreement") <= 45
+            and (g(r, "mtf_overbought") >= 1 or g(r, "mtf_oversold") >= 1)
+        ][:12],
+        "tf_stacked_ob": [
+            r for r in _top(rows, "mtf_overbought", 20) if g(r, "mtf_overbought") >= 2
+        ][:12],
+        "tf_stacked_os": [
+            r for r in _top(rows, "mtf_oversold", 20) if g(r, "mtf_oversold") >= 2
+        ][:12],
+        "forecast_up": [
+            r
+            for r in _top(rows, "forecast_edge", 25)
+            if r.get("forecast_dir") == "up" and g(r, "prob_up") >= 55
+        ][:12],
+        "forecast_down": [
+            r
+            for r in _top(rows, "forecast_edge", 25)
+            if r.get("forecast_dir") == "down" and g(r, "prob_up") <= 45
+        ][:12],
+        "forecast_conviction": [
+            r for r in _top(rows, "forecast_conf", 25) if g(r, "forecast_conf") >= 55
+        ][:12],
     }
 
+
+SCAN_BARS = 360
 
 BOARD_KEYS = [
     "alpha",
@@ -313,6 +352,14 @@ BOARD_KEYS = [
     "low_risk",
     "short_setups",
     "liquid",
+    "mtf_bull",
+    "mtf_bear",
+    "mtf_conflict",
+    "tf_stacked_ob",
+    "tf_stacked_os",
+    "forecast_up",
+    "forecast_down",
+    "forecast_conviction",
 ]
 
 BOARD_META = {
@@ -338,6 +385,14 @@ BOARD_META = {
     "low_risk": {"title": "Low risk trend", "blurb": "Quality setups with tame volatility"},
     "short_setups": {"title": "Short setups", "blurb": "Bearish structure with room to fall"},
     "liquid": {"title": "Deepest books", "blurb": "Best liquidity / tightest spreads"},
+    "mtf_bull": {"title": "MTF aligned long", "blurb": "Timeframes stacked bullish 1m → 1w"},
+    "mtf_bear": {"title": "MTF aligned short", "blurb": "Timeframes stacked bearish 1m → 1w"},
+    "mtf_conflict": {"title": "Timeframe conflict", "blurb": "Frames disagree — chop / turn risk"},
+    "tf_stacked_ob": {"title": "Overbought stack", "blurb": "RSI overbought on 2+ timeframes"},
+    "tf_stacked_os": {"title": "Oversold stack", "blurb": "RSI oversold on 2+ timeframes"},
+    "forecast_up": {"title": "Predicted up", "blurb": "Ensemble expects a move higher"},
+    "forecast_down": {"title": "Predicted down", "blurb": "Ensemble expects a move lower"},
+    "forecast_conviction": {"title": "High conviction", "blurb": "Strongest model agreement"},
 }
 
 
@@ -357,6 +412,49 @@ SORTABLE = [k for k in ALL_FIELDS] + [
 ]
 
 PRESETS: list[dict[str, Any]] = [
+    {
+        "id": "mtf_long_stack",
+        "title": "Multi-TF long stack",
+        "blurb": "Higher timeframes trending up with 65%+ agreement",
+        "sort": "mtf_score",
+        "filters": [
+            {"left": "mtf_score", "cmp": ">", "right": 40},
+            {"left": "mtf_agreement", "cmp": ">", "right": 65},
+            {"left": "mtf_timeframes", "cmp": ">", "right": 2},
+        ],
+    },
+    {
+        "id": "mtf_pullback_buy",
+        "title": "HTF trend, LTF dip",
+        "blurb": "1h trending up while the 15m is oversold — pullback entries",
+        "sort": "mtf_score",
+        "filters": [
+            {"left": "trend_1h", "cmp": "==", "right": "up"},
+            {"left": "rsi_15m", "cmp": "<", "right": 40},
+            {"left": "adx_1h", "cmp": ">", "right": 18},
+        ],
+    },
+    {
+        "id": "exhausted_stack",
+        "title": "Overbought on every frame",
+        "blurb": "RSI stretched on 2+ timeframes — fade / take profit",
+        "sort": "mtf_overbought",
+        "filters": [
+            {"left": "mtf_overbought", "cmp": ">", "right": 1},
+            {"left": "change_pct", "cmp": ">", "right": 2},
+        ],
+    },
+    {
+        "id": "predicted_movers",
+        "title": "Predicted movers",
+        "blurb": "Ensemble forecast: 58%+ probability with real expected range",
+        "sort": "forecast_edge",
+        "filters": [
+            {"left": "prob_up", "cmp": ">", "right": 58},
+            {"left": "forecast_conf", "cmp": ">", "right": 50},
+            {"left": "forecast_rr", "cmp": ">", "right": 1.2},
+        ],
+    },
     {
         "id": "breakout_ready",
         "title": "Breakout ready",
@@ -521,6 +619,8 @@ def run_query(
     }
 
 
+MTF_COLUMNS = ["mtf_score", "mtf_agreement", "rsi_1h", "trend_1h", "prob_up", "exp_move", "forecast_conf"]
+
 DEFAULT_COLUMNS = [
     "symbol",
     "last",
@@ -590,6 +690,7 @@ def scan(hub, symbols: list[str]) -> dict[str, Any]:
         btc_ret = _ret(list(btc_win.closes), 30)
     btc_returns = None
     if btc_win and len(btc_win) > 20:
+        btc_win = btc_win.tail(SCAN_BARS)
         bc = np.asarray(list(btc_win.closes), dtype=float)
         btc_returns = np.diff(bc) / np.clip(bc[:-1], 1e-12, None)
 
@@ -597,6 +698,8 @@ def scan(hub, symbols: list[str]) -> dict[str, Any]:
     heatmap: list[dict[str, Any]] = []
     for sym in symbols:
         win = hub.candles.get(sym)
+        if win:
+            win = win.tail(SCAN_BARS)
         if not win or len(win) < 25:
             continue
         t = hub.quote(sym)

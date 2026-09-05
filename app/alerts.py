@@ -176,6 +176,48 @@ class AlertEngine:
 
 ALERT_TEMPLATES = [
     {
+        "name": "Timeframes aligned",
+        "severity": "warn",
+        "message": "{symbol} timeframes aligned — MTF score {mtf_score}, agreement {mtf_agreement}%",
+        "rule": {
+            "op": "all",
+            "rules": [
+                {"left": "mtf_score", "cmp": ">", "right": 45},
+                {"left": "mtf_agreement", "cmp": ">", "right": 70},
+            ],
+        },
+    },
+    {
+        "name": "HTF trend, LTF oversold",
+        "severity": "info",
+        "message": "{symbol} 1h trend up with 15m RSI {rsi_15m} — pullback entry",
+        "rule": {
+            "op": "all",
+            "rules": [
+                {"left": "trend_1h", "cmp": "==", "right": "up"},
+                {"left": "rsi_15m", "cmp": "<", "right": 35},
+            ],
+        },
+    },
+    {
+        "name": "Overbought on every frame",
+        "severity": "warn",
+        "message": "{symbol} overbought on {mtf_overbought} timeframes — exhaustion risk",
+        "rule": {"op": "all", "rules": [{"left": "mtf_overbought", "cmp": ">", "right": 1}]},
+    },
+    {
+        "name": "High-probability forecast",
+        "severity": "warn",
+        "message": "{symbol} forecast {forecast_dir} — {prob_up}% up, {exp_move}% expected",
+        "rule": {
+            "op": "all",
+            "rules": [
+                {"left": "forecast_conf", "cmp": ">", "right": 60},
+                {"left": "forecast_edge", "cmp": ">", "right": 0.35},
+            ],
+        },
+    },
+    {
         "name": "Alpha breakout",
         "severity": "warn",
         "message": "{symbol} alpha {alpha} breaking out",

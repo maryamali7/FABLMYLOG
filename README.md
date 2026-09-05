@@ -11,6 +11,8 @@ A full trading terminal that:
 - Lets you build **custom strategies visually** — indicator rules, no code — and trades them live
 - **Backtests** any strategy (custom or built-in) over real candles in milliseconds
 - Ships an **advanced screener**: 40+ factors, custom queries, presets, grades and CSV export
+- Runs **multi-timeframe analysis** — RSI, trend, ADX, MACD and a rating on 1m/5m/15m/1h/4h/1d/1w with an alignment verdict
+- **Predicts the next move** with a six-model ensemble: direction, probability, expected move, target, cone, S/R and a plain-English "why"
 - Fires **custom alert rules** (with cooldowns, auto-watch and webhooks)
 - Reports **performance analytics** per strategy, symbol, exit reason and hour
 - Serves a dark trading dashboard with candles, order book, print tape, arb scanner, fills, and journal
@@ -45,6 +47,12 @@ Crypto trading can lose 100% of capital. This is software, not financial advice.
 exchanges WS ─┐
               ├─ MarketHub (normalized tickers / books / trades / candles)
 Binance REST ─┘
+                    │
+        ┌───────────┴────────────┐
+        ▼                        ▼
+  MTFEngine (1m…1w)        Rule frames / screener
+        │                        │
+        └────────► Forecast ensemble (6 models)
                     │
                     ▼
               Strategy ensemble  →  RiskGate  →  Paper (or live) execution
@@ -108,14 +116,62 @@ fees, slippage, stops, targets, trailing stops and a time stop:
 
 * **40+ factors per symbol** and composite **alpha**, **quality**, **risk** and **liquidity**
   scores plus an A–D grade and a 10-factor confluence count.
-* **22 boards** — alpha, confluence, quality, gainers/losers, volume, RSI extremes, squeeze,
+* **30 boards** — alpha, confluence, quality, gainers/losers, volume, RSI extremes, squeeze,
   coiled, breakouts, fresh MACD crosses, VWAP reclaims, ADX trend, relative strength,
-  mean reversion, volatility, hot money, dump bounce, low-risk trend, short setups, liquidity.
+  mean reversion, volatility, hot money, dump bounce, low-risk trend, short setups, liquidity,
+  plus **MTF aligned long/short**, **timeframe conflict**, **overbought / oversold stacks**,
+  **predicted up / down** and **high conviction**.
 * **Custom queries** — `POST /api/screener/query` with any number of field conditions,
   `match: all|any|none`, sorting, search and limit.
-* **8 saved presets** (breakout ready, oversold reversal, clean trend, high confluence,
+* **12 saved presets** (multi-TF long stack, HTF trend + LTF dip, overbought on every frame,
+  predicted movers, breakout ready, oversold reversal, clean trend, high confluence,
   low-risk alpha, volatility hunters, BTC outperformers, short pressure).
 * **Breadth summary** and **CSV export** (`/api/screener/export.csv`).
+
+## Multi-timeframe analysis
+
+Every watched symbol is rebuilt on **seven timeframes — 1m, 5m, 15m, 1h, 4h, 1d, 1w**.
+Candles come from exchange REST history when the venue is reachable and are otherwise
+resampled from the live 1m rolling window, so the feature degrades instead of disappearing.
+
+Per timeframe: RSI + state (overbought / bullish / neutral / bearish / oversold), stochastic,
+StochRSI, MACD state, ADX with ±DI, EMA stack, supertrend, Ichimoku cloud, ATR%, Bollinger %B,
+squeeze flag, a −100…+100 rating and a *strong buy → strong sell* label.
+
+Those frames are blended into one **alignment verdict** — a weighted score (higher timeframes
+count more), agreement %, bull/bear counts and explicit **conflicts** such as
+`15m overbought` while the 1h still trends up.
+
+| Route | Purpose |
+|---|---|
+| `GET /api/mtf/{symbol}` | every timeframe + alignment for one coin |
+| `GET /api/mtf` | alignment table across the watchlist |
+| `POST /api/mtf/refresh?symbol=` | force a rebuild |
+| `GET /api/candles/{symbol}?interval=15m` | resampled candles for any timeframe |
+
+## Next-move prediction
+
+`POST`-free `GET /api/predict/{symbol}?tf=15m` runs an ensemble of six models and returns a
+single actionable forecast:
+
+| Model | Reads |
+|---|---|
+| Trend | ADX / ±DI, supertrend, EMA stack, slope |
+| Mean reversion | z-score, RSI, Bollinger %B |
+| Analog | k-NN over normalized 20-bar return shapes — "what happened last time it looked like this" |
+| Drift regression | OLS fit of log price with R² as confidence |
+| Order flow | OBV, volume z-score, buy/sell pressure, book imbalance |
+| Volatility | EWMA (λ = 0.94) sizing of the expected range |
+
+Output: direction, probability up/down, expected move %, target with an upper/lower band,
+confidence, risk/reward to the nearest levels, a projected **cone path** for the chart,
+clustered **support / resistance** levels, the market **regime** and a ranked `rationale[]`
+explaining the call. Forecasts for the whole watchlist are cached by the robot loop and
+ranked at `GET /api/forecasts`; `GET /api/levels/{symbol}` returns just the structure.
+
+Multi-timeframe and forecast values are first-class **rule-engine fields**, so builder
+strategies, screener queries and alert rules can all say things like
+`trend_1h == up AND rsi_15m < 40 AND prob_up > 58`.
 
 ## Alert rules & analytics
 
@@ -141,6 +197,9 @@ per-exit-reason and hourly edge tables, streaks, a PnL histogram and equity-curv
 | GET | `/api/alerts/history` | triggered alerts |
 | GET | `/api/analytics` | performance tables |
 | GET/POST | `/api/risk` · `/api/risk/resume` | live risk tuning, clear a halt |
+| GET | `/api/mtf` · `/api/mtf/{sym}` · `POST /api/mtf/refresh` | multi-timeframe alignment |
+| GET | `/api/predict/{sym}?tf=&horizon=` | next-move forecast |
+| GET | `/api/forecasts` · `/api/levels/{sym}` | ranked forecasts, support/resistance |
 
 ## Config
 

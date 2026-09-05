@@ -30,6 +30,27 @@ from app.strategies import Strategy
 
 log = logging.getLogger("custom")
 
+# Optional hook that feeds extra per-symbol context (multi-timeframe RSI, forecast
+# probabilities, …) into every builder strategy evaluation.
+_CONTEXT_PROVIDER = None
+
+
+def set_context_provider(fn) -> None:
+    """Register a callable ``symbol -> dict`` merged into the rule context."""
+    global _CONTEXT_PROVIDER
+    _CONTEXT_PROVIDER = fn
+
+
+def extra_context(symbol: str) -> dict[str, Any]:
+    if _CONTEXT_PROVIDER is None:
+        return {}
+    try:
+        return dict(_CONTEXT_PROVIDER(symbol) or {})
+    except Exception as exc:  # pragma: no cover - defensive
+        log.debug("context provider failed for %s: %s", symbol, exc)
+        return {}
+
+
 STORE_PATH = ROOT / "data" / "custom_strategies.json"
 
 SIDES = ("long", "short", "both")
@@ -143,7 +164,8 @@ class CustomStrategy(Strategy):
         frame = FRAMES.get(symbol, win)
         if not frame:
             return None
-        ctx = context_at(frame, -1, extra={"live_price": price})
+        extra = {"live_price": price, **extra_context(symbol)}
+        ctx = context_at(frame, -1, extra=extra)
         return self.evaluate_ctx(symbol, ctx, price)
 
     def evaluate_ctx(self, symbol: str, ctx: dict[str, Any], price: float) -> Signal | None:
@@ -305,6 +327,96 @@ class CustomRegistry:
 # --------------------------------------------------------------------------- #
 
 TEMPLATES: list[dict[str, Any]] = [
+    {
+        "template_id": "mtf_pullback",
+        "name": "Multi-timeframe pullback",
+        "description": "1h and 4h trending up while the 15m cools off — buy the dip with the higher timeframes behind you.",
+        "tags": ["multi-timeframe", "pullback"],
+        "side": "long",
+        "confidence": 0.74,
+        "weight": 1.15,
+        "stop_loss_pct": 0.016,
+        "take_profit_pct": 0.042,
+        "trail_pct": 0.011,
+        "entry": {
+            "op": "all",
+            "rules": [
+                {"left": "trend_1h", "cmp": "==", "right": "up"},
+                {"left": "mtf_score", "cmp": ">", "right": 25},
+                {"left": "rsi_15m", "cmp": "<", "right": 48},
+                {"left": "rsi", "cmp": ">", "right": 35},
+            ],
+        },
+        "exit": {
+            "op": "any",
+            "rules": [
+                {"left": "rsi_15m", "cmp": ">", "right": 74},
+                {"left": "trend_1h", "cmp": "==", "right": "down"},
+            ],
+        },
+    },
+    {
+        "template_id": "mtf_stack_momentum",
+        "name": "Timeframe stack momentum",
+        "description": "Every loaded timeframe agrees and the ensemble forecast leans up — ride confirmed alignment.",
+        "tags": ["multi-timeframe", "momentum"],
+        "side": "long",
+        "confidence": 0.78,
+        "weight": 1.2,
+        "stop_loss_pct": 0.02,
+        "take_profit_pct": 0.05,
+        "entry": {
+            "op": "all",
+            "rules": [
+                {"left": "mtf_agreement", "cmp": ">", "right": 70},
+                {"left": "mtf_score", "cmp": ">", "right": 40},
+                {"left": "prob_up", "cmp": ">", "right": 55},
+                {"left": "mtf_overbought", "cmp": "<", "right": 2},
+            ],
+        },
+        "exit": {"op": "any", "rules": [{"left": "mtf_score", "cmp": "<", "right": 5}]},
+    },
+    {
+        "template_id": "forecast_edge",
+        "name": "Forecast edge",
+        "description": "Take the trade only when the prediction ensemble is confident and the risk/reward to the next level works.",
+        "tags": ["forecast", "prediction"],
+        "side": "long",
+        "confidence": 0.7,
+        "weight": 1.0,
+        "stop_loss_pct": 0.015,
+        "take_profit_pct": 0.04,
+        "entry": {
+            "op": "all",
+            "rules": [
+                {"left": "prob_up", "cmp": ">", "right": 60},
+                {"left": "forecast_conf", "cmp": ">", "right": 55},
+                {"left": "forecast_rr", "cmp": ">", "right": 1.5},
+                {"left": "resistance_dist", "cmp": ">", "right": 0.4},
+            ],
+        },
+        "exit": {"op": "any", "rules": [{"left": "prob_up", "cmp": "<", "right": 45}]},
+    },
+    {
+        "template_id": "exhaustion_fade",
+        "name": "Exhaustion fade",
+        "description": "Two or more timeframes overbought while the forecast rolls over — fade the stretch.",
+        "tags": ["multi-timeframe", "mean-reversion"],
+        "side": "short",
+        "confidence": 0.66,
+        "weight": 0.9,
+        "stop_loss_pct": 0.018,
+        "take_profit_pct": 0.03,
+        "entry": {
+            "op": "all",
+            "rules": [
+                {"left": "mtf_overbought", "cmp": ">", "right": 1},
+                {"left": "prob_up", "cmp": "<", "right": 45},
+                {"left": "change_pct", "cmp": ">", "right": 2.5},
+            ],
+        },
+        "exit": {"op": "any", "rules": [{"left": "rsi", "cmp": "<", "right": 45}]},
+    },
     {
         "template_id": "squeeze_break",
         "name": "Squeeze breakout",

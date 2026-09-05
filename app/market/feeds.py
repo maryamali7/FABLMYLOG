@@ -524,12 +524,15 @@ class SimulatedFeed(WSClient):
         now = time.time()
         self.connected = True
         log.warning("simulated market tape online for %d symbols", len(self.symbols))
+        # ~4 days of 1m candles so the 5m/15m/1h/4h multi-timeframe views all have
+        # enough history to work offline (1d/1w need real REST history).
+        seed_bars = 5760
         for s, px in prices.items():
             p = px
-            for i in range(90):
-                ts = now - (90 - i) * 60
-                p *= math.exp(rng.gauss(0.00015, 0.0035))
-                await self._emit(s, p, ts, rng)
+            for i in range(seed_bars):
+                ts = now - (seed_bars - i) * 60
+                p *= math.exp(rng.gauss(0.00004, 0.0035))
+                await self._emit(s, p, ts, rng, seed=True)
                 prices[s] = p
         while not self._stop.is_set():
             await asyncio.sleep(0.35)
@@ -541,7 +544,7 @@ class SimulatedFeed(WSClient):
                 prices[s] *= math.exp(shock)
                 await self._emit(s, prices[s], ts, rng)
 
-    async def _emit(self, symbol: str, last: float, ts: float, rng: random.Random) -> None:
+    async def _emit(self, symbol: str, last: float, ts: float, rng: random.Random, seed: bool = False) -> None:
         self._mark()
         spread = last * rng.uniform(0.00012, 0.0004)
         bid = last - spread / 2
@@ -562,6 +565,8 @@ class SimulatedFeed(WSClient):
                 change_pct=chg,
             ),
         )
+        if seed:
+            return
         if rng.random() < 0.45:
             await _maybe(
                 self.on_trade,

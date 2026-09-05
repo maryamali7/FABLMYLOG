@@ -466,6 +466,7 @@ setInterval(() => {
 // bridge used by pro.js
 window.FML = {
   get state() { return state; },
+  get selected() { return selected; },
   get screener() { return screener; },
   get tickers() { return tickers; },
   select,

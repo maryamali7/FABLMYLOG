@@ -25,6 +25,7 @@
         <button class="nav" data-view="trade">Trade</button>
         <button class="nav" data-view="markets">Markets</button>
         <button class="nav" data-view="screeners">Screener Pro</button>
+        <button class="nav" data-view="mtf">Multi-TF &amp; forecast</button>
         <button class="nav" data-view="builder">Strategy builder</button>
         <button class="nav" data-view="strategies">Strategy desk</button>
         <button class="nav" data-view="alerts">Alert rules</button>
@@ -193,6 +194,84 @@
             </table>
           </div>
           <div class="heat" id="heat"></div>
+        </div>
+      </section>
+
+      <!-- ================= MULTI-TIMEFRAME + FORECAST ================= -->
+      <section class="view" data-view="mtf">
+        <div class="card">
+          <div class="card-h">
+            <div>
+              <h2>Multi-timeframe analysis</h2>
+              <p class="sub" id="mtfMeta">RSI, trend, ADX and rating on every timeframe from 1m to 1w</p>
+            </div>
+            <div class="row-btns">
+              <select id="mtfSymbol" class="mini"></select>
+              <button class="btn tiny" id="mtfRefresh">Refresh</button>
+              <button class="btn tiny" id="mtfWatch">Watch</button>
+            </div>
+          </div>
+
+          <div class="tf-strip" id="mtfStrip"></div>
+
+          <div class="align-wrap">
+            <div class="align-meter">
+              <div class="align-bar"><span id="mtfAlignFill"></span><i id="mtfAlignZero"></i></div>
+              <div class="align-legend"><span>bearish</span><span>neutral</span><span>bullish</span></div>
+            </div>
+            <div class="align-facts" id="mtfAlignFacts"></div>
+          </div>
+        </div>
+
+        <div class="fc-grid">
+          <div class="card">
+            <div class="card-h">
+              <div>
+                <h2>Next move forecast</h2>
+                <p class="sub" id="fcMeta">Ensemble of trend, mean-reversion, analog, drift, flow and volatility models</p>
+              </div>
+              <div class="row-btns">
+                <select id="fcTf" class="mini"></select>
+                <button class="btn tiny primary" id="fcRun">Predict</button>
+              </div>
+            </div>
+            <div class="fc-head" id="fcHead"></div>
+            <canvas id="fcChart" height="200"></canvas>
+            <div class="fc-models" id="fcModels"></div>
+            <div class="fc-why" id="fcWhy"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-h"><h2>Key levels</h2></div>
+            <div class="lvl-list" id="fcLevels"></div>
+            <div class="card-h" style="margin-top:14px"><h2>Regime</h2></div>
+            <div id="fcRegime" class="regime-box"></div>
+          </div>
+        </div>
+
+        <div class="fc-grid">
+          <div class="card">
+            <div class="card-h">
+              <div><h2>Forecast leaders</h2><p class="sub">Highest-edge predictions across the watchlist</p></div>
+            </div>
+            <div class="table-wrap">
+              <table class="data">
+                <thead><tr><th>Symbol</th><th>Dir</th><th>Prob&nbsp;up</th><th>Exp move</th><th>Conf</th><th>R:R</th><th>Reason</th></tr></thead>
+                <tbody id="fcBoard"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-h">
+              <div><h2>Alignment matrix</h2><p class="sub">RSI per timeframe — click a row to load it</p></div>
+            </div>
+            <div class="table-wrap">
+              <table class="data">
+                <thead><tr id="mtfMatrixHead"></tr></thead>
+                <tbody id="mtfMatrix"></tbody>
+              </table>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -427,5 +506,6 @@
   <div id="toast"></div>
   <script src="/static/app.js"></script>
   <script src="/static/pro.js"></script>
+  <script src="/static/mtf.js"></script>
 </body>
 </html>

@@ -28,7 +28,8 @@ def _win(n=200, start=100.0, drift=1.002):
 def test_frame_has_every_catalog_field():
     w, _ = _win()
     frame = compute_frame(w)
-    missing = [k for k in ALL_FIELDS if k not in frame and ALL_FIELDS[k]["group"] != "Screener"]
+    contextual = {"Screener", "Timeframes", "Forecast"}
+    missing = [k for k in ALL_FIELDS if k not in frame and ALL_FIELDS[k]["group"] not in contextual]
     assert missing == []
     assert len(frame["close"]) == 200
 

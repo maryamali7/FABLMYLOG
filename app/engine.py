@@ -9,17 +9,25 @@ from typing import Any
 from app.alerts import AlertEngine
 from app.analytics import analyze
 from app.config import Settings, has_live_keys
-from app.custom import CustomRegistry
+from app.custom import CustomRegistry, set_context_provider
 from app.indicators import atr, ema, roc
 from app.market.hub import MarketHub
 from app.market.rest import fetch_klines, fetch_universe, ping_exchanges
 from app.models import Fill, Position, Side, Signal, SignalKind, Ticker
+from app.screener import build_boards
 from app.screener import scan as scan_screener
+from app.predict import predict as forecast_symbol
+from app.predict import rank_forecasts
 from app.rules import FRAMES
 from app.storage import Store
+from app.timeframes import MTFEngine
 from app.strategies import build_strategies, ensemble
 
 log = logging.getLogger("engine")
+
+# Strategies/indicators only need a few hundred bars; the hub keeps days of 1m
+# history for the multi-timeframe engine, so views are trimmed before use.
+STRATEGY_BARS = 300
 
 
 class RiskGate:
@@ -111,6 +119,12 @@ class Robot:
         self.regime: dict[str, Any] = {"name": "unknown", "risk_on": True}
         self.rule_alerts: list[dict[str, Any]] = []
         self.last_scan_rows: list[dict[str, Any]] = []
+        self.mtf = MTFEngine(hub, fetch_klines)
+        self.forecasts: dict[str, dict[str, Any]] = {}
+        self.forecast_board: dict[str, list[dict[str, Any]]] = {"up": [], "down": [], "all": []}
+        self._forecast_cursor = 0
+        self.loop_ms = 0.0
+        set_context_provider(self.symbol_context)
 
     def refresh_strategies(self) -> None:
         """Built-ins + everything created in the strategy builder."""
@@ -177,6 +191,12 @@ class Robot:
 
         await asyncio.gather(*[_seed(sym) for sym in self.watchlist])
         await self.hub.start(self.watchlist)
+        self.mtf.rest_ok = bool(self.rest_ok.get("binance", True))
+        for sym in self.watchlist[:6]:
+            try:
+                await self.mtf.refresh_symbol(sym)
+            except Exception as exc:
+                log.debug("mtf prime %s: %s", sym, exc)
         self.risk.day_start_equity = self.mark_equity
         self.risk.peak_equity = self.mark_equity
 
@@ -211,6 +231,13 @@ class Robot:
             await asyncio.sleep(self.settings.loop_interval_sec)
 
     async def step(self) -> None:
+        started = time.time()
+        try:
+            await self._step()
+        finally:
+            self.loop_ms = round((time.time() - started) * 1000, 1)
+
+    async def _step(self) -> None:
         self.loops += 1
         self.last_loop = time.time()
         equity = self.mark_equity
@@ -226,10 +253,23 @@ class Robot:
             await self._manage_position(sym)
 
         self.regime = self._compute_regime()
+        try:
+            await self.mtf.refresh_next(self.watchlist, batch=2)
+        except Exception as exc:
+            log.debug("mtf refresh: %s", exc)
+        if self.loops % 3 == 0:
+            try:
+                self._refresh_forecasts(batch=4)
+            except Exception as exc:
+                log.debug("forecast: %s", exc)
         if self.loops % 2 == 0:
             try:
                 self.screener = scan_screener(self.hub, self.watchlist)
-                self.last_scan_rows = self.screener.get("rows") or []
+                self.last_scan_rows = self._enrich_rows(self.screener.get("rows") or [])
+                self.screener["rows"] = self.last_scan_rows
+                self.screener["boards"] = build_boards(self.last_scan_rows)
+                self.screener["mtf"] = self.mtf.scan(self.watchlist)[:20]
+                self.screener["forecasts"] = self.forecast_board
                 for a in self.screener.get("alerts") or []:
                     self.alerts.insert(0, a)
                 self.alerts = self.alerts[:40]
@@ -245,7 +285,7 @@ class Robot:
             t = self.hub.quote(sym)
             if not t:
                 continue
-            win = self.hub.candles[sym]
+            win = self.hub.candles[sym].tail(STRATEGY_BARS)
             raw: list[Signal] = []
             for strat in self.strategies:
                 if not strat.enabled:
@@ -296,6 +336,8 @@ class Robot:
         take = px * (1 + take_pct)
         atr_val = 0.0
         win = self.hub.candles.get(sig.symbol)
+        if win:
+            win = win.tail(180)
         if win and len(win) >= 20:
             a = atr(list(win.highs), list(win.lows), list(win.closes))[-1]
             if a and a == a:
@@ -448,6 +490,97 @@ class Robot:
         await self.store.add_fill(fill)
         await self.emit("fill", {**fill.to_dict(), "pnl": pnl, "partial": True})
 
+    # ---- multi-timeframe + forecasting ---------------------------------- #
+
+    def symbol_context(self, symbol: str) -> dict[str, Any]:
+        """Extra rule-engine context (MTF + forecast) for builder strategies."""
+        ctx: dict[str, Any] = {}
+        try:
+            ctx.update(self.mtf.flat_fields(symbol))
+        except Exception:
+            pass
+        ctx.update(self.forecast_fields(symbol))
+        return ctx
+
+    def forecast_fields(self, symbol: str) -> dict[str, Any]:
+        f = self.forecasts.get(symbol)
+        if not f or not f.get("ok"):
+            return {}
+        levels = f.get("levels") or {}
+        sup = levels.get("nearest_support") or {}
+        res = levels.get("nearest_resistance") or {}
+        return {
+            "prob_up": f["probability_up"],
+            "exp_move": f["expected_move_pct"],
+            "forecast_conf": f["confidence"],
+            "forecast_dir": f["direction"],
+            "forecast_edge": round(abs(f["expected_move_pct"]) * f["confidence"] / 100.0, 4),
+            "forecast_rr": f.get("risk_reward") or 0.0,
+            "regime": (f.get("regime") or {}).get("name", "unknown"),
+            "support_dist": abs(sup.get("distance_pct", 0.0)),
+            "resistance_dist": abs(res.get("distance_pct", 0.0)),
+        }
+
+    def _refresh_forecasts(self, batch: int = 4) -> None:
+        symbols = self.watchlist
+        if not symbols:
+            return
+        for _ in range(max(1, batch)):
+            sym = symbols[self._forecast_cursor % len(symbols)]
+            self._forecast_cursor += 1
+            win = self.hub.candles.get(sym)
+            if not win or len(win) < 60:
+                continue
+            try:
+                out = forecast_symbol(
+                    win,
+                    symbol=sym,
+                    timeframe="1m",
+                    mtf=self.mtf.snapshot(sym),
+                    book=self.hub.books.get(sym),
+                    ticker=self.hub.quote(sym),
+                )
+            except Exception as exc:
+                log.debug("forecast %s: %s", sym, exc)
+                continue
+            if out.get("ok"):
+                self.forecasts[sym] = out
+        self.forecast_board = rank_forecasts(list(self.forecasts.values()))
+
+    def forecast(self, symbol: str, timeframe: str = "1m", horizon: int | None = None) -> dict[str, Any]:
+        """On-demand forecast for any symbol / timeframe."""
+        sym = symbol.upper().replace("-", "/")
+        candles: Any = self.hub.candles.get(sym)
+        if timeframe != "1m":
+            rows = self.mtf.best_frame(sym, timeframe)
+            if rows:
+                candles = rows
+        if candles is None or (hasattr(candles, "__len__") and len(candles) < 40):
+            return {"ok": False, "error": f"no candle history for {sym} yet", "symbol": sym}
+        out = forecast_symbol(
+            candles,
+            symbol=sym,
+            timeframe=timeframe,
+            horizon=horizon,
+            mtf=self.mtf.snapshot(sym),
+            book=self.hub.books.get(sym),
+            ticker=self.hub.quote(sym),
+        )
+        if out.get("ok") and timeframe == "1m":
+            self.forecasts[sym] = out
+        return out
+
+    def _enrich_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Merge multi-timeframe + forecast fields onto screener rows."""
+        for row in rows:
+            sym = row.get("symbol", "")
+            try:
+                row.update(self.mtf.flat_fields(sym))
+            except Exception:
+                pass
+            row.update(self.forecast_fields(sym))
+        return rows
+
     async def _run_alert_rules(self, rows: list[dict[str, Any]]) -> None:
         """Evaluate user alert rules against the freshest screener rows."""
         if not rows or not self.alert_engine.rules:
@@ -512,6 +645,7 @@ class Robot:
         checked = 0
         for sym in self.watchlist[:limit]:
             win = self.hub.candles.get(sym)
+            win = win.tail(STRATEGY_BARS) if win else None
             t = self.hub.quote(sym)
             if not win or len(win) < 40:
                 continue
@@ -570,6 +704,7 @@ class Robot:
         win = self.hub.candles.get("BTC/USDT")
         if not win or len(win) < 30:
             return {"name": "unknown", "risk_on": True, "detail": "warming up"}
+        win = win.tail(180)
         closes = list(win.closes)
         e9 = float(ema(closes, 9)[-1])
         e21 = float(ema(closes, 21)[-1])
@@ -676,6 +811,13 @@ class Robot:
             "alert_rules": self.alert_engine.list(),
             "rule_alerts": self.rule_alerts[:12],
             "screener_summary": (self.screener or {}).get("summary", {}),
+            "mtf_ready": len({k[0] for k in self.mtf.metrics}),
+            "forecast_board": {
+                "up": (self.forecast_board.get("up") or [])[:6],
+                "down": (self.forecast_board.get("down") or [])[:6],
+            },
+            "forecasts_cached": len(self.forecasts),
+            "loop_ms": self.loop_ms,
             "frame_cache": {"hits": FRAMES.hits, "misses": FRAMES.misses},
             "risk": self.settings.risk.model_dump(),
             "feeds": self.hub.health(),

@@ -214,7 +214,39 @@ SCREENER_ONLY_FIELDS: dict[str, dict[str, Any]] = {
     "symbol": {"label": "Symbol", "group": "Screener", "fmt": "text"},
 }
 
-ALL_FIELDS = {**FIELDS, **SCREENER_ONLY_FIELDS}
+# multi-timeframe + forecast fields (merged onto screener rows by the robot)
+MTF_TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d", "1w"]
+MTF_FIELDS: dict[str, dict[str, Any]] = {}
+for _tf in MTF_TIMEFRAMES:
+    MTF_FIELDS[f"rsi_{_tf}"] = {"label": f"RSI {_tf}", "group": "Timeframes", "fmt": "num"}
+    MTF_FIELDS[f"score_{_tf}"] = {"label": f"Rating {_tf} (-100..100)", "group": "Timeframes", "fmt": "num"}
+    MTF_FIELDS[f"trend_{_tf}"] = {"label": f"Trend {_tf} (up/down/flat)", "group": "Timeframes", "fmt": "text"}
+    MTF_FIELDS[f"adx_{_tf}"] = {"label": f"ADX {_tf}", "group": "Timeframes", "fmt": "num"}
+MTF_FIELDS.update(
+    {
+        "mtf_score": {"label": "MTF alignment score", "group": "Timeframes", "fmt": "num"},
+        "mtf_agreement": {"label": "MTF agreement %", "group": "Timeframes", "fmt": "num"},
+        "mtf_bias": {"label": "MTF bias (long/short)", "group": "Timeframes", "fmt": "text"},
+        "mtf_verdict": {"label": "MTF verdict", "group": "Timeframes", "fmt": "text"},
+        "mtf_timeframes": {"label": "Timeframes loaded", "group": "Timeframes", "fmt": "num"},
+        "mtf_overbought": {"label": "Timeframes overbought", "group": "Timeframes", "fmt": "num"},
+        "mtf_oversold": {"label": "Timeframes oversold", "group": "Timeframes", "fmt": "num"},
+    }
+)
+
+FORECAST_FIELDS: dict[str, dict[str, Any]] = {
+    "prob_up": {"label": "Probability up %", "group": "Forecast", "fmt": "num"},
+    "exp_move": {"label": "Expected move %", "group": "Forecast", "fmt": "pct"},
+    "forecast_conf": {"label": "Forecast confidence %", "group": "Forecast", "fmt": "num"},
+    "forecast_dir": {"label": "Forecast direction", "group": "Forecast", "fmt": "text"},
+    "forecast_edge": {"label": "Forecast edge", "group": "Forecast", "fmt": "num"},
+    "forecast_rr": {"label": "Forecast risk/reward", "group": "Forecast", "fmt": "num"},
+    "regime": {"label": "Regime", "group": "Forecast", "fmt": "text"},
+    "support_dist": {"label": "Distance to support %", "group": "Forecast", "fmt": "pct"},
+    "resistance_dist": {"label": "Distance to resistance %", "group": "Forecast", "fmt": "pct"},
+}
+
+ALL_FIELDS = {**FIELDS, **SCREENER_ONLY_FIELDS, **MTF_FIELDS, **FORECAST_FIELDS}
 
 COMPARATORS: dict[str, dict[str, Any]] = {
     ">": {"label": "greater than", "arity": 2},

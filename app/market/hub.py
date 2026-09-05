@@ -34,7 +34,7 @@ class MarketHub:
         self.best: dict[str, Ticker] = {}
         self.books: dict[str, OrderBook] = {}
         self.trades: deque[TradeTick] = deque(maxlen=400)
-        self.candles: dict[str, RollingWindow] = defaultdict(lambda: RollingWindow(600))
+        self.candles: dict[str, RollingWindow] = defaultdict(lambda: RollingWindow(6200))
         self.universe: list[dict[str, Any]] = []
         self.feeds: list[WSClient] = []
         self._lock = asyncio.Lock()

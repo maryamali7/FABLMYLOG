@@ -20,6 +20,7 @@ from app.custom import TEMPLATES, template as custom_template, validate_spec
 from app.engine import Robot
 from app.market.hub import MarketHub
 from app.market.rest import fetch_klines, fetch_universe
+from app.predict import HORIZONS
 from app.rules import COMPARATORS, field_catalog
 from app.screener import (
     BOARD_META,
@@ -32,6 +33,7 @@ from app.screener import (
 from app.screener import scan as scan_screener
 from app.storage import Store
 from app.strategies import REGISTRY
+from app.timeframes import TF_LABEL, TF_ORDER
 
 logging.basicConfig(
     level=logging.INFO,
@@ -158,6 +160,10 @@ async def api_universe(limit: int = 200):
 @app.get("/api/candles/{symbol:path}")
 async def api_candles(symbol: str, interval: str = "1m"):
     symbol = symbol.upper().replace("-", "/")
+    if interval != "1m":
+        rows = robot.mtf.best_frame(symbol, interval)
+        if rows and len(rows) > 5:
+            return rows
     win = hub.candles.get(symbol)
     if win and len(win) > 5:
         rows = []
@@ -373,6 +379,8 @@ async def api_builder_catalog():
         "boards": BOARD_META,
         "presets": PRESETS,
         "columns": DEFAULT_COLUMNS,
+        "timeframes": [{"tf": tf, "label": TF_LABEL[tf]} for tf in TF_ORDER],
+        "horizons": HORIZONS,
     }
 
 
@@ -526,6 +534,110 @@ async def api_screener_symbol(symbol: str):
         if row.get("symbol") == sym:
             return row
     return {"error": "symbol not scanned", "symbol": sym}
+
+
+# --------------------------------------------------------------------------- #
+# multi-timeframe analysis + next-move forecasting
+# --------------------------------------------------------------------------- #
+
+
+@app.get("/api/mtf")
+async def api_mtf_scan(limit: int = Query(40, ge=1, le=200)):
+    """Alignment table across every tracked symbol."""
+    return {
+        "ts": time.time(),
+        "timeframes": [{"tf": tf, "label": TF_LABEL[tf]} for tf in TF_ORDER],
+        "rows": robot.mtf.scan(robot.watchlist)[:limit],
+        "ready": len({k[0] for k in robot.mtf.metrics}),
+    }
+
+
+@app.get("/api/mtf/{symbol:path}")
+async def api_mtf_symbol(symbol: str, refresh: bool = False):
+    sym = symbol.upper().replace("-", "/")
+    if refresh:
+        await robot.mtf.refresh_symbol(sym, force=True)
+    snap = robot.mtf.snapshot(sym)
+    if not snap.get("frames"):
+        await robot.mtf.refresh_symbol(sym, force=True)
+        snap = robot.mtf.snapshot(sym)
+    snap["forecast"] = _slim_forecast(robot.forecasts.get(sym))
+    return snap
+
+
+@app.post("/api/mtf/refresh")
+async def api_mtf_refresh(symbol: str | None = None):
+    targets = [symbol.upper().replace("-", "/")] if symbol else robot.watchlist[:8]
+    done = []
+    for sym in targets:
+        try:
+            await robot.mtf.refresh_symbol(sym, force=True)
+            done.append(sym)
+        except Exception as exc:
+            log.debug("mtf refresh %s: %s", sym, exc)
+    return {"ok": True, "refreshed": done}
+
+
+def _slim_forecast(f: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not f:
+        return None
+    keep = (
+        "symbol",
+        "timeframe",
+        "direction",
+        "probability_up",
+        "probability_down",
+        "expected_move_pct",
+        "target",
+        "upper",
+        "lower",
+        "confidence",
+        "risk_reward",
+        "horizon_label",
+    )
+    return {k: f[k] for k in keep if k in f}
+
+
+@app.get("/api/predict/{symbol:path}")
+async def api_predict(
+    symbol: str,
+    tf: str = Query("1m"),
+    horizon: int | None = Query(None, ge=1, le=200),
+):
+    if tf not in TF_ORDER:
+        return {"ok": False, "error": f"unknown timeframe {tf}", "timeframes": TF_ORDER}
+    sym = symbol.upper().replace("-", "/")
+    if tf != "1m" and not robot.mtf.best_frame(sym, tf):
+        await robot.mtf.refresh_symbol(sym, force=True)
+    return robot.forecast(sym, timeframe=tf, horizon=horizon)
+
+
+@app.get("/api/forecasts")
+async def api_forecasts(limit: int = Query(12, ge=1, le=60)):
+    board = robot.forecast_board or {}
+    return {
+        "ts": time.time(),
+        "up": (board.get("up") or [])[:limit],
+        "down": (board.get("down") or [])[:limit],
+        "all": (board.get("all") or [])[:limit],
+        "cached": len(robot.forecasts),
+    }
+
+
+@app.get("/api/levels/{symbol:path}")
+async def api_levels(symbol: str, tf: str = Query("1m")):
+    sym = symbol.upper().replace("-", "/")
+    out = robot.forecast(sym, timeframe=tf)
+    if not out.get("ok"):
+        return out
+    return {
+        "ok": True,
+        "symbol": sym,
+        "timeframe": tf,
+        "price": out.get("price"),
+        "levels": out.get("levels"),
+        "regime": out.get("regime"),
+    }
 
 
 # --------------------------------------------------------------------------- #
