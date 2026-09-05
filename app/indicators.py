@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
+from itertools import islice
 
 import numpy as np
 
@@ -365,6 +366,24 @@ class RollingWindow:
             self.ts[-1] = ts
         else:
             self.push(ts, price, price, price, price, vol)
+
+    def tail(self, n: int) -> "RollingWindow":
+        """Cheap bounded view of the last ``n`` bars.
+
+        The hub keeps days of 1m history for multi-timeframe resampling, but the
+        strategy/indicator layer only ever needs a few hundred bars — feeding it
+        the whole window turns the pure-Python indicator loops into a bottleneck.
+        """
+        if n <= 0 or len(self.closes) <= n:
+            return self
+        out = RollingWindow(n)
+        out.ts = deque(islice(self.ts, len(self.ts) - n, len(self.ts)), maxlen=n)
+        out.opens = deque(islice(self.opens, len(self.opens) - n, len(self.opens)), maxlen=n)
+        out.highs = deque(islice(self.highs, len(self.highs) - n, len(self.highs)), maxlen=n)
+        out.lows = deque(islice(self.lows, len(self.lows) - n, len(self.lows)), maxlen=n)
+        out.closes = deque(islice(self.closes, len(self.closes) - n, len(self.closes)), maxlen=n)
+        out.volumes = deque(islice(self.volumes, len(self.volumes) - n, len(self.volumes)), maxlen=n)
+        return out
 
     def __len__(self) -> int:
         return len(self.closes)

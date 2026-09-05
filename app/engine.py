@@ -6,16 +6,37 @@ import time
 import uuid
 from typing import Any
 
-from app.config import Settings, has_live_keys
+from app.alerts import AlertEngine
+from app.analytics import analyze
+from app.config import ROOT, Settings, has_live_keys
+from app.custom import CustomRegistry, set_context_provider
+from app.forecast_track import ForecastTracker
 from app.indicators import atr, ema, roc
 from app.market.hub import MarketHub
 from app.market.rest import fetch_klines, fetch_universe, ping_exchanges
 from app.models import Fill, Position, Side, Signal, SignalKind, Ticker
+from app.screener import build_boards
 from app.screener import scan as scan_screener
+from app.predict import HORIZONS
+from app.predict import predict as forecast_symbol
+from app.predict import rank_forecasts
+from app.rules import FRAMES
 from app.storage import Store
+from app.timeframes import MTFEngine
+from app.edge import EdgeEngine
+from app.keys import KeyStore
+from app.live import LiveRouter
+from app.orders import OMS, Order, OrderError
+from app.portfolio import Journal
+from app.tradeset import TradeSet
+from app.universe import Universe
 from app.strategies import build_strategies, ensemble
 
 log = logging.getLogger("engine")
+
+# Strategies/indicators only need a few hundred bars; the hub keeps days of 1m
+# history for the multi-timeframe engine, so views are trimmed before use.
+STRATEGY_BARS = 300
 
 
 class RiskGate:
@@ -78,7 +99,11 @@ class Robot:
         self.store = store
         self.hub = hub
         self.risk = RiskGate(settings)
-        self.strategies = build_strategies(settings.strategies)
+        self.builtins = build_strategies(settings.strategies)
+        self.custom = CustomRegistry()
+        self.alert_engine = AlertEngine()
+        self.strategies: list[Any] = []
+        self.refresh_strategies()
         self.cash = settings.starting_equity
         self.positions: dict[str, Position] = {}
         self.signals: list[dict[str, Any]] = []
@@ -101,6 +126,35 @@ class Robot:
         self.alerts: list[dict[str, Any]] = []
         self.strategy_pnl: dict[str, float] = {}
         self.regime: dict[str, Any] = {"name": "unknown", "risk_on": True}
+        self.rule_alerts: list[dict[str, Any]] = []
+        self.last_scan_rows: list[dict[str, Any]] = []
+        self.mtf = MTFEngine(hub, fetch_klines)
+        self.forecasts: dict[str, dict[str, Any]] = {}
+        self.forecast_board: dict[str, list[dict[str, Any]]] = {"up": [], "down": [], "all": []}
+        self._forecast_cursor = 0
+        self.loop_ms = 0.0
+        self.tracker = ForecastTracker(ROOT / "data" / "forecast_log.json")
+        self.instruments = Universe()
+        # --- coin selection, trade quality and live-trading plumbing ---
+        self.tradeset = TradeSet(ROOT / "data" / "trading.json")
+        self.edge = EdgeEngine(ROOT / "data" / "edge.json")
+        self.keys = KeyStore(ROOT / "data" / "api_keys.json")
+        self.live = LiveRouter(self.keys)
+        self.live_armed = False
+        self.live_venue = "binance"
+        self.max_live_notional = 50.0
+        self.live_errors: list[dict[str, Any]] = []
+        self.oms = OMS(ROOT / "data" / "orders.json")
+        self.journal = Journal(ROOT / "data" / "journal.json")
+        self.trade_log: list[dict[str, Any]] = []   # closed trades with R multiples
+        # desk positions are yours: the signal engine will not close them unless
+        # you hand them over. Protective stops and brackets always still apply.
+        self.manage_manual = False
+        set_context_provider(self.symbol_context)
+
+    def refresh_strategies(self) -> None:
+        """Built-ins + everything created in the strategy builder."""
+        self.strategies = [*self.builtins, *self.custom.all()]
 
     def bind_broadcast(self, fn) -> None:
         self._broadcast = fn
@@ -163,6 +217,15 @@ class Robot:
 
         await asyncio.gather(*[_seed(sym) for sym in self.watchlist])
         await self.hub.start(self.watchlist)
+        self.mtf.rest_ok = bool(self.rest_ok.get("binance", True))
+        for sym in self.watchlist[:6]:
+            try:
+                await self.mtf.refresh_symbol(sym)
+            except Exception as exc:
+                log.debug("mtf prime %s: %s", sym, exc)
+        asyncio.create_task(self._load_instruments())
+        if not self.tracker.settled:
+            asyncio.create_task(self.backfill_scoreboard())
         self.risk.day_start_equity = self.mark_equity
         self.risk.peak_equity = self.mark_equity
 
@@ -197,6 +260,13 @@ class Robot:
             await asyncio.sleep(self.settings.loop_interval_sec)
 
     async def step(self) -> None:
+        started = time.time()
+        try:
+            await self._step()
+        finally:
+            self.loop_ms = round((time.time() - started) * 1000, 1)
+
+    async def _step(self) -> None:
         self.loops += 1
         self.last_loop = time.time()
         equity = self.mark_equity
@@ -207,17 +277,38 @@ class Robot:
             except Exception:
                 pass
 
-        # manage open risk first
+        # working orders first: a resting stop must fire before anything else
+        await self._match_orders()
+
+        # then manage open risk
         for sym in list(self.positions.keys()):
             await self._manage_position(sym)
 
         self.regime = self._compute_regime()
+        if self.loops % 150 == 0 and self.instruments.stale and not self.instruments.loading:
+            asyncio.create_task(self._load_instruments())
+        try:
+            await self.mtf.refresh_next(self.watchlist, batch=2)
+        except Exception as exc:
+            log.debug("mtf refresh: %s", exc)
+        if self.loops % 3 == 0:
+            try:
+                self._refresh_forecasts(batch=4)
+            except Exception as exc:
+                log.debug("forecast: %s", exc)
         if self.loops % 2 == 0:
             try:
                 self.screener = scan_screener(self.hub, self.watchlist)
+                self.last_scan_rows = self._enrich_rows(self.screener.get("rows") or [])
+                self.screener["rows"] = self.last_scan_rows
+                self.screener["boards"] = build_boards(self.last_scan_rows)
+                self.screener["mtf"] = self.mtf.scan(self.watchlist)[:20]
+                self.screener["forecasts"] = self.forecast_board
                 for a in self.screener.get("alerts") or []:
                     self.alerts.insert(0, a)
                 self.alerts = self.alerts[:40]
+                self.tradeset.refresh_auto(self.last_scan_rows)
+                await self._run_alert_rules(self.last_scan_rows)
             except Exception as exc:
                 log.debug("screener: %s", exc)
 
@@ -225,11 +316,12 @@ class Robot:
             return
 
         fresh_signals: list[dict[str, Any]] = []
+        tradable = set(self.tradeset.active(self.watchlist))
         for sym in self.watchlist:
             t = self.hub.quote(sym)
             if not t:
                 continue
-            win = self.hub.candles[sym]
+            win = self.hub.candles[sym].tail(STRATEGY_BARS)
             raw: list[Signal] = []
             for strat in self.strategies:
                 if not strat.enabled:
@@ -245,7 +337,8 @@ class Robot:
             combined = ensemble(raw, self.settings.risk.min_confidence)
             if combined:
                 fresh_signals.append(combined.to_dict())
-                await self._maybe_enter(combined, t)
+                if sym in tradable or sym in self.positions:
+                    await self._maybe_enter(combined, t)
 
         self.signals = fresh_signals[:80]
 
@@ -256,33 +349,56 @@ class Robot:
         if sig.kind == SignalKind.SELL and sig.symbol not in self.positions:
             return
         if sig.kind == SignalKind.SELL and sig.symbol in self.positions:
+            pos = self.positions[sig.symbol]
+            if pos.spec_id == "manual" and not self.manage_manual:
+                return  # hands off a desk position
             await self._close(sig.symbol, t.last, f"signal {sig.reason}")
             return
-        notional = self.risk.size(self.mark_equity, sig.confidence)
-        if not self.regime.get("risk_on", True):
-            notional *= 0.55
-        wr = self.wins / max(1, self.wins + self.losses)
-        if self.wins + self.losses >= 8:
-            kelly = max(0.45, min(1.15, 0.5 + (wr - 0.5)))
-            notional *= kelly
-        ok, why = self.risk.allow_entry(t, self.positions, self.mark_equity, notional)
-        if not ok:
+        allowed, why = self.tradeset.allows(sig.symbol, self.watchlist)
+        if not allowed:
+            self.edge.reject({"symbol": sig.symbol, "strategy": sig.strategy, "score": 0, "blocks": [why]})
             return
+
+        equity = self.mark_equity
+        atr_val = self._atr_value(sig.symbol)
         px = self._fill_price(t, Side.BUY)
+        decision: dict[str, Any] = {"passed": True, "score": 100.0, "size_mult": 1.0, "blocks": []}
+        if self.edge.cfg.get("enabled", True):
+            decision = self.edge.evaluate(sig.symbol, self._edge_context(sig, t, atr_val))
+            if not decision["passed"]:
+                self.edge.reject(decision)
+                return
+
+        legacy = self.risk.size(equity, sig.confidence)
+        if not self.regime.get("risk_on", True):
+            legacy *= 0.55
+        cap = equity * self.settings.risk.max_position_pct
+        if self.edge.cfg.get("enabled", True):
+            plan = self.edge.position_size(
+                equity, px, atr_val, decision, cap, wins=self.wins, losses=self.losses
+            )
+            notional = plan["notional"]
+        else:
+            plan = {"notional": legacy}
+            notional = legacy
+        notional *= self.tradeset.size_multiplier(sig.symbol)
+        notional = min(notional, cap)
+        if notional <= 0:
+            return
+        ok, why = self.risk.allow_entry(t, self.positions, equity, notional)
+        if not ok:
+            self.edge.reject({"symbol": sig.symbol, "strategy": sig.strategy,
+                              "score": decision.get("score"), "blocks": [why]})
+            return
         fee = notional * (self.settings.risk.fee_bps / 10_000)
         if self.cash < notional + fee:
             return
         qty = notional / px
-        stop = px * (1 - self.settings.risk.stop_loss_pct)
-        take = px * (1 + self.settings.risk.take_profit_pct)
-        atr_val = 0.0
-        win = self.hub.candles.get(sig.symbol)
-        if win and len(win) >= 20:
-            a = atr(list(win.highs), list(win.lows), list(win.closes))[-1]
-            if a and a == a:
-                atr_val = float(a)
-                stop = min(stop, px - 1.6 * atr_val)
-                take = max(take, px + 2.4 * atr_val)
+        extras = sig.extras or {}
+        stop_pct = float(extras.get("stop_loss_pct") or self.settings.risk.stop_loss_pct)
+        take_pct = float(extras.get("take_profit_pct") or self.settings.risk.take_profit_pct)
+        levels = self.edge.initial_levels(px, atr_val, px * (1 - stop_pct), px * (1 + take_pct))
+        stop, take = levels["stop"], levels["take"]
         pos = Position(
             symbol=sig.symbol,
             side=Side.BUY,
@@ -296,9 +412,18 @@ class Robot:
             exchange=t.exchange,
             peak=px,
             atr=atr_val,
+            trail_pct=float(extras.get("trail_pct") or 0.0),
+            spec_id=str(extras.get("spec_id") or ""),
+            confidence=round(float(sig.confidence), 3),
+            risk=round(levels["risk"], 10),
+            quality=float(decision.get("score") or 0.0),
         )
+        order_ref = await self._route_live_entry(sig.symbol, notional)
+        if order_ref:
+            pos.live_order = order_ref
         self.cash -= notional + fee
         self.positions[sig.symbol] = pos
+        self.edge.note_entry(sig.symbol)
         fill = Fill(
             id=uuid.uuid4().hex[:12],
             symbol=sig.symbol,
@@ -320,8 +445,223 @@ class Robot:
                 "stop": stop,
                 "take": take,
                 "confidence": sig.confidence,
+                "quality": pos.quality,
+                "size_plan": plan,
             },
         )
+
+    def _atr_value(self, symbol: str) -> float:
+        win = self.hub.candles.get(symbol)
+        if win:
+            win = win.tail(180)
+        if not win or len(win) < 20:
+            return 0.0
+        try:
+            a = atr(list(win.highs), list(win.lows), list(win.closes))[-1]
+        except Exception:
+            return 0.0
+        return float(a) if a and a == a else 0.0
+
+    def _edge_context(self, sig: Signal, t: Ticker, atr_val: float) -> dict[str, Any]:
+        """Everything the quality gate needs, gathered from the live engine."""
+        row = next((r for r in self.last_scan_rows if r.get("symbol") == sig.symbol), {})
+        mtf = {}
+        try:
+            mtf = self.mtf.flat_fields(sig.symbol) or {}
+        except Exception:
+            pass
+        fc = self.forecasts.get(sig.symbol) or {}
+        prob = fc.get("prob_up")
+        base = sig.symbol.split("/")[0]
+        correlated = sum(1 for s in self.positions if s.split("/")[0] != base)
+        return {
+            "confidence": sig.confidence,
+            "strategy": sig.strategy,
+            "mtf_agreement": mtf.get("mtf_agreement"),
+            "mtf_bias": mtf.get("mtf_bias"),
+            "forecast_prob": prob,
+            "risk_on": bool(self.regime.get("risk_on", True)),
+            # screener trend_score is 0-100; the gate wants -1..+1
+            "trend_score": (float(row["trend_score"]) / 50.0 - 1.0) if row.get("trend_score") is not None else 0.0,
+            "rsi": row.get("rsi"),
+            "atr_pct": row.get("atr_pct") if row.get("atr_pct") is not None
+            else ((atr_val / t.last * 100.0) if (atr_val and t.last) else None),
+            "spread_bps": t.spread_bps,
+            "quote_volume": row.get("quote_volume") or (float(row.get("volume") or 0) * (t.last or 0)) or None,
+            "open_correlated": correlated,
+        }
+
+    async def _route_live_entry(self, symbol: str, notional: float) -> str:
+        """Mirror a paper entry onto the exchange, when live trading is armed."""
+        if not self.live_armed or self.mode != "live":
+            return ""
+        amount = min(notional, self.max_live_notional)
+        try:
+            res = await self.live.market_buy(self.live_venue, symbol, amount)
+            ref = str(res.get("orderId") or (res.get("result") or {}).get("orderId") or "sent")
+            log.info("live buy %s %.2f -> %s", symbol, amount, ref)
+            return ref
+        except Exception as exc:
+            self.live_errors.insert(0, {"ts": time.time(), "symbol": symbol, "side": "buy", "error": str(exc)[:200]})
+            self.live_errors = self.live_errors[:20]
+            log.error("live buy failed for %s: %s", symbol, exc)
+            await self.emit("live_error", {"symbol": symbol, "side": "buy", "error": str(exc)[:200]})
+            return ""
+
+    async def _route_live_exit(self, pos: Position, qty: float) -> None:
+        if not self.live_armed or self.mode != "live" or not pos.live_order:
+            return
+        try:
+            await self.live.market_sell(self.live_venue, pos.symbol, qty)
+        except Exception as exc:
+            self.live_errors.insert(0, {"ts": time.time(), "symbol": pos.symbol, "side": "sell", "error": str(exc)[:200]})
+            self.live_errors = self.live_errors[:20]
+            log.error("live sell failed for %s: %s", pos.symbol, exc)
+            await self.emit("live_error", {"symbol": pos.symbol, "side": "sell", "error": str(exc)[:200]})
+
+    async def _match_orders(self) -> None:
+        """Walk the working-order book against the live tape."""
+        if not self.oms.orders:
+            return
+        symbols = {o.symbol for o in self.oms.orders.values() if o.open}
+        for sym in symbols:
+            t = self.hub.quote(sym)
+            if not t or not t.last:
+                continue
+            pos = self.positions.get(sym)
+            try:
+                intents = self.oms.match(
+                    sym, t.last, t.bid, t.ask, position_qty=pos.qty if pos else 0.0
+                )
+            except Exception as exc:
+                log.warning("order match failed for %s: %s", sym, exc)
+                continue
+            for intent in intents:
+                await self._execute_order(intent["order"], intent["qty"], intent["price"], t)
+
+    async def _execute_order(self, order: Order, qty: float, price: float, t: Ticker) -> None:
+        """Settle one order fill against cash and positions."""
+        fee_rate = self.settings.risk.fee_bps / 10_000
+        if order.side == "buy":
+            notional = qty * price
+            fee = notional * fee_rate
+            if self.cash < notional + fee:
+                self.oms.cancel(order.id, "insufficient cash")
+                return
+            self.cash -= notional + fee
+            pos = self.positions.get(order.symbol)
+            if pos:  # average up into the existing position
+                total = pos.qty + qty
+                pos.entry = (pos.entry * pos.qty + price * qty) / total if total else price
+                pos.qty = total
+            else:
+                atr_val = self._atr_value(order.symbol)
+                self.positions[order.symbol] = Position(
+                    symbol=order.symbol,
+                    side=Side.BUY,
+                    qty=qty,
+                    entry=price,
+                    stop=price * (1 - self.settings.risk.stop_loss_pct),
+                    take=price * (1 + self.settings.risk.take_profit_pct),
+                    trail=price,
+                    opened_ts=time.time(),
+                    strategy=order.label or f"{order.type} order",
+                    exchange=t.exchange,
+                    peak=price,
+                    atr=atr_val,
+                    risk=max(price * self.settings.risk.stop_loss_pct, price * 0.0005),
+                    spec_id="manual" if order.source == "manual" else "",
+                )
+            fill = Fill(
+                id=uuid.uuid4().hex[:12], symbol=order.symbol, side=Side.BUY, qty=qty, price=price,
+                fee=fee, ts=time.time(), strategy=order.label or order.type,
+                exchange=t.exchange, paper=self.mode != "live", reason=f"{order.type} order filled",
+            )
+            await self.store.add_fill(fill)
+            await self.emit("fill", {**fill.to_dict(), "order_id": order.id})
+        else:
+            pos = self.positions.get(order.symbol)
+            if not pos or pos.qty <= 0:
+                self.oms.cancel(order.id, "no position to sell")
+                return
+            qty = min(qty, pos.qty)
+            # settle the order first: closing the position sweeps the rest of
+            # the book for this symbol, and this order must not sweep itself
+            self.oms.confirm(order, qty, price)
+            if qty >= pos.qty - 1e-12:
+                await self._close(order.symbol, price, order.label or f"{order.type} order")
+            else:
+                await self._scale_out(order.symbol, qty / pos.qty, order.label or f"{order.type} order")
+            await self.emit("order", {"event": "fill", **order.to_dict()})
+            return
+        self.oms.confirm(order, qty, price)
+        await self.emit("order", {"event": "fill", **order.to_dict()})
+
+    async def place_order(self, spec: dict[str, Any]) -> dict[str, Any]:
+        """Validate and rest an order from the trade desk."""
+        symbol = str(spec.get("symbol") or "").upper().replace("-", "/")
+        t = self.hub.quote(symbol)
+        if not t:
+            return {"ok": False, "error": f"no live market data for {symbol}"}
+        equity = self.mark_equity
+        qty = float(spec.get("qty") or 0.0)
+        quote_qty = float(spec.get("quote_qty") or 0.0)
+        # risk-based sizing: "lose no more than X% of equity if the stop hits"
+        risk_pct = float(spec.get("risk_pct") or 0.0)
+        stop_price = float(spec.get("stop_loss") or spec.get("stop_price") or 0.0)
+        ref_price = float(spec.get("price") or 0.0) or t.last
+        if risk_pct > 0 and stop_price > 0 and ref_price > stop_price:
+            qty = (equity * risk_pct / 100.0) / (ref_price - stop_price)
+        elif float(spec.get("equity_pct") or 0) > 0:
+            quote_qty = equity * float(spec["equity_pct"]) / 100.0
+        try:
+            order = self.oms.place(
+                Order(
+                    symbol=symbol,
+                    side=str(spec.get("side") or "buy"),
+                    type=str(spec.get("type") or "market"),
+                    qty=qty,
+                    quote_qty=quote_qty,
+                    price=float(spec.get("price") or 0.0),
+                    stop_price=float(spec.get("stop_price") or 0.0),
+                    trail_pct=float(spec.get("trail_pct") or 0.0),
+                    tif=str(spec.get("tif") or "gtc"),
+                    reduce_only=bool(spec.get("reduce_only")),
+                    post_only=bool(spec.get("post_only")),
+                    label=str(spec.get("label") or "manual"),
+                    source="manual",
+                ),
+                last=t.last, bid=t.bid, ask=t.ask,
+            )
+        except OrderError as exc:
+            return {"ok": False, "error": str(exc)}
+
+        brackets = []
+        take = float(spec.get("take_profit") or 0.0)
+        trail = float(spec.get("bracket_trail_pct") or 0.0)
+        if order.side == "buy" and (stop_price > 0 or take > 0 or trail > 0):
+            brackets = [
+                o.to_dict()
+                for o in self.oms.attach_bracket(
+                    symbol, order.qty, stop_price=stop_price, take_price=take,
+                    parent_id=order.id, trail_pct=trail, label=order.label or "bracket",
+                )
+            ]
+        await self._match_orders()
+        # if the order filled and you gave it protection, the position carries it
+        pos = self.positions.get(symbol)
+        if pos and order.side == "buy":
+            if stop_price > 0:
+                pos.stop = stop_price
+                pos.risk = max(pos.entry - stop_price, pos.entry * 0.0005)
+            if take > 0:
+                pos.take = take
+            if trail > 0:
+                pos.trail_pct = trail
+        await self.emit("order", {"event": "placed", **order.to_dict()})
+        return {"ok": True, "order": order.to_dict(), "brackets": brackets,
+                "working": self.oms.working(), "equity": equity,
+                "position": pos.to_dict() if pos else None}
 
     def _fill_price(self, t: Ticker, side: Side) -> float:
         slip = self.settings.risk.slippage_bps / 10_000
@@ -338,21 +678,39 @@ class Robot:
             return
         px = t.last
         pos.unrealized = self._mtm(pos)
-        if pos.side == Side.BUY:
-            pos.peak = max(pos.peak, px)
-            trail_stop = pos.peak * (1 - self.settings.risk.trailing_stop_pct)
-            if pos.atr:
-                trail_stop = max(trail_stop, pos.peak - 1.2 * pos.atr)
-            pos.trail = max(pos.stop, trail_stop)
-            if not pos.scaled and px >= pos.entry + 0.5 * (pos.take - pos.entry):
-                await self._scale_out(symbol, 0.5, "partial take 50% at 0.5R")
+        if pos.side != Side.BUY:
+            return
+        pos.peak = max(pos.peak, px)
+
+        if self.edge.cfg.get("enabled", True):
+            for action in self.edge.manage(pos, px):
+                kind = action.get("kind")
+                if kind == "stop":
+                    pos.stop = max(pos.stop, float(action["value"]))
+                    pos.trail = pos.stop
+                elif kind == "scale":
+                    pos.partials_taken += 1
+                    await self._scale_out(symbol, float(action["frac"]), action["reason"])
+                    if symbol not in self.positions:
+                        return
+                elif kind == "close":
+                    await self._close(symbol, px, action["reason"])
+                    return
+            pos = self.positions.get(symbol)
+            if not pos:
                 return
-            if px <= pos.trail:
-                await self._close(symbol, px, "stop / trailing stop")
-                return
-            if px >= pos.take:
-                await self._close(symbol, px, "take profit")
-                return
+
+        trail_pct = pos.trail_pct or self.settings.risk.trailing_stop_pct
+        trail_stop = pos.peak * (1 - trail_pct)
+        if pos.atr:
+            trail_stop = max(trail_stop, pos.peak - self.edge.cfg["atr_trail_mult"] * pos.atr)
+        pos.trail = max(pos.stop, trail_stop)
+        if px <= pos.trail:
+            await self._close(symbol, px, "stop / trailing stop")
+            return
+        if px >= pos.take:
+            await self._close(symbol, px, "take profit")
+            return
 
     async def _close(self, symbol: str, price: float, reason: str) -> None:
         pos = self.positions.pop(symbol, None)
@@ -363,6 +721,7 @@ class Robot:
         notional = pos.qty * px
         fee = notional * (self.settings.risk.fee_bps / 10_000)
         pnl = (px - pos.entry) * pos.qty - fee
+        await self._route_live_exit(pos, pos.qty)
         # restore cash: we spent entry*qty+entry_fee, receive exit notional - fee
         self.cash += notional - fee
         self.realized += pnl
@@ -372,6 +731,9 @@ class Robot:
         else:
             self.losses += 1
             self.risk.last_loss_ts = time.time()
+        r_mult = ((px - pos.entry) / pos.risk) if pos.risk else 0.0
+        self.edge.record_trade(pos.strategy, symbol, pnl, round(r_mult, 3))
+        self.oms.cancel_all(symbol)  # a closed position never leaves brackets behind
         fill = Fill(
             id=uuid.uuid4().hex[:12],
             symbol=symbol,
@@ -386,6 +748,14 @@ class Robot:
             pnl=pnl,
             reason=reason,
         )
+        self.trade_log.insert(0, {
+            "id": fill.id, "symbol": symbol, "strategy": pos.strategy, "qty": pos.qty,
+            "entry": pos.entry, "exit": px, "pnl": round(pnl, 4), "r": round(r_mult, 3),
+            "reason": reason, "opened": pos.opened_ts, "closed": time.time(),
+            "quality": pos.quality, "held_sec": round(time.time() - pos.opened_ts, 1),
+            "journal": self.journal.get(fill.id),
+        })
+        self.trade_log = self.trade_log[:400]
         await self.store.add_fill(fill)
         await self.emit("fill", {**fill.to_dict(), "pnl": pnl})
 
@@ -396,6 +766,7 @@ class Robot:
             return
         qty = pos.qty * frac
         px = self._fill_price(t, Side.SELL)
+        await self._route_live_exit(pos, qty)
         notional = qty * px
         fee = notional * (self.settings.risk.fee_bps / 10_000)
         pnl = (px - pos.entry) * qty - fee
@@ -425,10 +796,333 @@ class Robot:
         await self.store.add_fill(fill)
         await self.emit("fill", {**fill.to_dict(), "pnl": pnl, "partial": True})
 
+    # ---- multi-timeframe + forecasting ---------------------------------- #
+
+    def symbol_context(self, symbol: str) -> dict[str, Any]:
+        """Extra rule-engine context (MTF + forecast) for builder strategies."""
+        ctx: dict[str, Any] = {}
+        try:
+            ctx.update(self.mtf.flat_fields(symbol))
+        except Exception:
+            pass
+        ctx.update(self.forecast_fields(symbol))
+        return ctx
+
+    def _last_price(self, symbol: str) -> float | None:
+        t = self.hub.quote(symbol)
+        if t and t.last:
+            return float(t.last)
+        win = self.hub.candles.get(symbol)
+        if win and len(win):
+            return float(win.closes[-1])
+        return None
+
+    def forecast_fields(self, symbol: str) -> dict[str, Any]:
+        f = self.forecasts.get(symbol)
+        if not f or not f.get("ok"):
+            return {}
+        levels = f.get("levels") or {}
+        sup = levels.get("nearest_support") or {}
+        res = levels.get("nearest_resistance") or {}
+        return {
+            "prob_up": f["probability_up"],
+            "exp_move": f["expected_move_pct"],
+            "forecast_conf": f["confidence"],
+            "forecast_dir": f["direction"],
+            "forecast_edge": round(abs(f["expected_move_pct"]) * f["confidence"] / 100.0, 4),
+            "forecast_rr": f.get("risk_reward") or 0.0,
+            "regime": (f.get("regime") or {}).get("name", "unknown"),
+            "support_dist": abs(sup.get("distance_pct", 0.0)),
+            "resistance_dist": abs(res.get("distance_pct", 0.0)),
+        }
+
+    async def backfill_scoreboard(self, symbols: list[str] | None = None, points: int = 8) -> int:
+        """Seed the forecast scoreboard from candle history.
+
+        Each sample runs the ensemble on a truncated window (so it only ever
+        sees bars that existed at that moment) and grades it against the price
+        the market actually printed one horizon later.
+        """
+        targets = symbols or self.watchlist[:6]
+        graded = 0
+        for sym in targets:
+            win = self.hub.candles.get(sym)
+            if not win or len(win) < 400:
+                continue
+            rows = [
+                {
+                    "ts": win.ts[i],
+                    "open": win.opens[i],
+                    "high": win.highs[i],
+                    "low": win.lows[i],
+                    "close": win.closes[i],
+                    "volume": win.volumes[i],
+                }
+                for i in range(len(win))
+            ]
+            horizon = HORIZONS.get("1m", 15)
+            spacing = max(horizon, (len(rows) - 260) // max(1, points))
+            cut = len(rows) - horizon - 1
+            for _ in range(points):
+                if cut < 260:
+                    break
+                history = rows[:cut]
+                try:
+                    out = forecast_symbol(history, symbol=sym, timeframe="1m")
+                except Exception:
+                    break
+                if out.get("ok"):
+                    exit_px = rows[cut - 1 + horizon]["close"]
+                    if self.tracker.grade_historic(out, exit_px, ts=rows[cut - 1]["ts"]):
+                        graded += 1
+                cut -= spacing
+                await asyncio.sleep(0)
+        if graded:
+            self.tracker.save()
+            log.info("forecast scoreboard seeded with %d graded historical calls", graded)
+        return graded
+
+    async def _load_instruments(self) -> None:
+        """Pull every venue catalog (spot + futures) in the background."""
+        try:
+            report = await self.instruments.refresh()
+        except Exception as exc:
+            log.debug("instrument catalog: %s", exc)
+            return
+        if report.get("count"):
+            await self.emit(
+                "universe",
+                {
+                    "count": report.get("count"),
+                    "source": report.get("source"),
+                    "venues": len(report.get("ok") or []),
+                },
+            )
+            # keep the legacy single-venue universe list in sync for the search box
+            top = self.instruments.query(market="spot", quote=self.settings.quote_asset, limit=400)
+            self.universe = [
+                {
+                    "symbol": r["symbol"],
+                    "last": r["last"],
+                    "change_pct": r["change_pct"],
+                    "volume": r["volume_usd"],
+                    "venue": r["venue"],
+                    "market": r["market"],
+                }
+                for r in top["rows"]
+            ] or self.universe
+
+    async def add_symbols(self, symbols: list[str]) -> list[str]:
+        """Append instruments to the live watchlist (deduped, capped)."""
+        merged = list(dict.fromkeys([*self.watchlist, *[s.upper().replace("-", "/") for s in symbols]]))
+        await self.set_watchlist(merged)
+        return self.watchlist
+
+    def _forecast_score(self) -> dict[str, Any]:
+        """Small scoreboard summary for the live snapshot."""
+        st = self.tracker
+        graded = [r for r in st.settled[:200] if r.get("hit") is not None]
+        return {
+            "open": len(st.open),
+            "settled": len(st.settled),
+            "hit_rate": round(sum(1 for r in graded if r["hit"]) / len(graded) * 100, 1)
+            if graded
+            else None,
+        }
+
+    def _refresh_forecasts(self, batch: int = 4) -> None:
+        symbols = self.watchlist
+        if not symbols:
+            return
+        for _ in range(max(1, batch)):
+            sym = symbols[self._forecast_cursor % len(symbols)]
+            self._forecast_cursor += 1
+            win = self.hub.candles.get(sym)
+            if not win or len(win) < 60:
+                continue
+            try:
+                out = forecast_symbol(
+                    win,
+                    symbol=sym,
+                    timeframe="1m",
+                    mtf=self.mtf.snapshot(sym),
+                    book=self.hub.books.get(sym),
+                    ticker=self.hub.quote(sym),
+                )
+            except Exception as exc:
+                log.debug("forecast %s: %s", sym, exc)
+                continue
+            if out.get("ok"):
+                self.forecasts[sym] = out
+                self.tracker.record(out)
+        self.forecast_board = rank_forecasts(list(self.forecasts.values()))
+        try:
+            settled = self.tracker.settle(self._last_price)
+        except Exception as exc:
+            log.debug("forecast settle: %s", exc)
+            settled = []
+        if settled:
+            hits = sum(1 for r in settled if r.get("hit"))
+            log.debug("settled %d forecasts (%d hits)", len(settled), hits)
+
+    def forecast(self, symbol: str, timeframe: str = "1m", horizon: int | None = None) -> dict[str, Any]:
+        """On-demand forecast for any symbol / timeframe."""
+        sym = symbol.upper().replace("-", "/")
+        candles: Any = self.hub.candles.get(sym)
+        if timeframe != "1m":
+            rows = self.mtf.best_frame(sym, timeframe)
+            if rows:
+                candles = rows
+        if candles is None or (hasattr(candles, "__len__") and len(candles) < 40):
+            return {"ok": False, "error": f"no candle history for {sym} yet", "symbol": sym}
+        out = forecast_symbol(
+            candles,
+            symbol=sym,
+            timeframe=timeframe,
+            horizon=horizon,
+            mtf=self.mtf.snapshot(sym),
+            book=self.hub.books.get(sym),
+            ticker=self.hub.quote(sym),
+        )
+        if out.get("ok") and timeframe == "1m":
+            self.forecasts[sym] = out
+        return out
+
+    def _enrich_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Merge multi-timeframe + forecast fields onto screener rows."""
+        for row in rows:
+            sym = row.get("symbol", "")
+            try:
+                row.update(self.mtf.flat_fields(sym))
+            except Exception:
+                pass
+            row.update(self.forecast_fields(sym))
+        return rows
+
+    async def _run_alert_rules(self, rows: list[dict[str, Any]]) -> None:
+        """Evaluate user alert rules against the freshest screener rows."""
+        if not rows or not self.alert_engine.rules:
+            return
+        try:
+            fired = self.alert_engine.evaluate(rows)
+        except Exception as exc:
+            log.debug("alert rules: %s", exc)
+            return
+        watch_extra: list[str] = []
+        for event in fired:
+            self.rule_alerts.insert(0, event)
+            self.alerts.insert(0, {"ts": event["ts"], "kind": "rule", "symbol": event["symbol"], "text": event["text"]})
+            await self.emit("alert", {k: event[k] for k in ("rule", "symbol", "severity", "text")})
+            if event.get("auto_watch") and event["symbol"] not in self.watchlist:
+                watch_extra.append(event["symbol"])
+            if event.get("webhook"):
+                asyncio.create_task(self._post_webhook(event["webhook"], event))
+        self.rule_alerts = self.rule_alerts[:60]
+        self.alerts = self.alerts[:40]
+        if watch_extra:
+            await self.set_watchlist([*self.watchlist, *watch_extra])
+
+    async def _post_webhook(self, url: str, event: dict[str, Any]) -> None:
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=6) as client:
+                await client.post(url, json={k: v for k, v in event.items() if k != "webhook"})
+        except Exception as exc:
+            log.debug("webhook %s: %s", url, exc)
+
+    # ---- builder / risk plumbing ---------------------------------------- #
+
+    def save_custom(self, spec: dict[str, Any]):
+        strat, errors = self.custom.upsert(spec)
+        if strat:
+            self.refresh_strategies()
+        return strat, errors
+
+    def delete_custom(self, spec_id: str) -> bool:
+        ok = self.custom.delete(spec_id)
+        if ok:
+            self.refresh_strategies()
+        return ok
+
+    def toggle_custom(self, spec_id: str, enabled: bool | None = None) -> bool | None:
+        out = self.custom.toggle(spec_id, enabled)
+        if out is not None:
+            self.refresh_strategies()
+        return out
+
+    def preview_custom(self, spec: dict[str, Any], limit: int = 25) -> dict[str, Any]:
+        """Dry-run a builder spec across the watchlist without trading it."""
+        from app.custom import CustomStrategy, validate_spec
+
+        errors = validate_spec(spec)
+        if errors:
+            return {"ok": False, "errors": errors, "matches": []}
+        probe = CustomStrategy({**spec, "enabled": True, "cooldown_sec": 0})
+        matches: list[dict[str, Any]] = []
+        checked = 0
+        for sym in self.watchlist[:limit]:
+            win = self.hub.candles.get(sym)
+            win = win.tail(STRATEGY_BARS) if win else None
+            t = self.hub.quote(sym)
+            if not win or len(win) < 40:
+                continue
+            checked += 1
+            price = t.last if t else float(win.closes[-1])
+            try:
+                sig = probe.evaluate(sym, win, price)
+            except Exception as exc:
+                return {"ok": False, "errors": [f"{sym}: {exc}"], "matches": []}
+            if sig:
+                matches.append(
+                    {
+                        "symbol": sym,
+                        "kind": sig.kind.value,
+                        "confidence": round(sig.confidence, 3),
+                        "price": price,
+                        "reason": sig.reason,
+                        "trace": (sig.extras or {}).get("trace", []),
+                    }
+                )
+        trace = probe.last_trace.get("entry", []) if probe.last_trace else []
+        return {
+            "ok": True,
+            "errors": [],
+            "checked": checked,
+            "matches": matches,
+            "sample_trace": trace[:10],
+        }
+
+    def update_risk(self, patch: dict[str, Any]) -> dict[str, Any]:
+        """Live-tune the risk gate from the dashboard."""
+        cfg = self.settings.risk
+        applied: dict[str, Any] = {}
+        for key, value in (patch or {}).items():
+            if not hasattr(cfg, key) or value is None:
+                continue
+            try:
+                current = getattr(cfg, key)
+                cast = type(current)(value) if not isinstance(current, bool) else bool(value)
+            except (TypeError, ValueError):
+                continue
+            setattr(cfg, key, cast)
+            applied[key] = cast
+        self.risk.cfg = cfg
+        return applied
+
+    async def analytics(self) -> dict[str, Any]:
+        fills = await self.store.recent_fills(500)
+        equity = await self.store.equity_series(500)
+        data = analyze(fills, equity)
+        data["strategy_pnl"] = self.strategy_pnl
+        data["open_positions"] = len(self.positions)
+        return data
+
     def _compute_regime(self) -> dict[str, Any]:
         win = self.hub.candles.get("BTC/USDT")
         if not win or len(win) < 30:
             return {"name": "unknown", "risk_on": True, "detail": "warming up"}
+        win = win.tail(180)
         closes = list(win.closes)
         e9 = float(ema(closes, 9)[-1])
         e21 = float(ema(closes, 21)[-1])
@@ -445,6 +1139,8 @@ class Robot:
         }
 
     def toggle_strategy(self, name: str, enabled: bool | None = None) -> bool | None:
+        if name in self.custom.strategies:
+            return self.toggle_custom(name, enabled)
         for s in self.strategies:
             if s.name == name:
                 s.enabled = (not s.enabled) if enabled is None else bool(enabled)
@@ -523,10 +1219,56 @@ class Robot:
                     "family": getattr(s, "family", "core"),
                     "weight": s.weight,
                     "enabled": s.enabled,
+                    "custom": bool(getattr(s, "custom", False)),
+                    "fires": int(getattr(s, "fires", 0)),
                     "pnl": self.strategy_pnl.get(s.name, 0.0),
                 }
                 for s in self.strategies
             ],
+            "custom_strategies": self.custom.list(),
+            "alert_rules": self.alert_engine.list(),
+            "rule_alerts": self.rule_alerts[:12],
+            "screener_summary": (self.screener or {}).get("summary", {}),
+            "mtf_ready": len({k[0] for k in self.mtf.metrics}),
+            "forecast_board": {
+                "up": (self.forecast_board.get("up") or [])[:6],
+                "down": (self.forecast_board.get("down") or [])[:6],
+            },
+            "forecasts_cached": len(self.forecasts),
+            "forecast_score": self._forecast_score(),
+            "orders": {
+                "working": len([o for o in self.oms.orders.values() if o.open]),
+                "by_symbol": {
+                    sym: sum(1 for o in self.oms.orders.values() if o.open and o.symbol == sym)
+                    for sym in {o.symbol for o in self.oms.orders.values() if o.open}
+                },
+            },
+            "trading": {
+                "mode": self.tradeset.mode,
+                "active": self.tradeset.active(self.watchlist),
+                "selected": len(self.tradeset.symbols),
+            },
+            "edge": {
+                "enabled": bool(self.edge.cfg.get("enabled", True)),
+                "min_quality": self.edge.cfg.get("min_quality"),
+                "accepted": self.edge.accepted,
+                "rejected": sum(self.edge.reject_counts.values()),
+                "trades_today": self.edge.trades_today,
+                "consecutive_losses": self.edge.consecutive_losses,
+            },
+            "live": {
+                "armed": self.live_armed,
+                "venue": self.live_venue,
+                "max_notional": self.max_live_notional,
+                "errors": len(self.live_errors),
+            },
+            "instruments": {
+                "count": len(self.instruments.rows),
+                "source": self.instruments.report.get("source", "none"),
+                "venues": len(self.instruments.report.get("ok") or []),
+            },
+            "loop_ms": self.loop_ms,
+            "frame_cache": {"hits": FRAMES.hits, "misses": FRAMES.misses},
             "risk": self.settings.risk.model_dump(),
             "feeds": self.hub.health(),
             "rest_ok": self.rest_ok,

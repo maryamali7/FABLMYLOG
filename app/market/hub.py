@@ -21,6 +21,7 @@ from app.market.feeds import (
 )
 from app.models import OrderBook, Ticker, TradeTick
 from app.symbols import compact, from_binance
+from app.tape import TapeBook
 
 log = logging.getLogger("hub")
 
@@ -34,7 +35,9 @@ class MarketHub:
         self.best: dict[str, Ticker] = {}
         self.books: dict[str, OrderBook] = {}
         self.trades: deque[TradeTick] = deque(maxlen=400)
-        self.candles: dict[str, RollingWindow] = defaultdict(lambda: RollingWindow(600))
+        #: consolidated per-symbol order flow across every connected venue
+        self.tape = TapeBook()
+        self.candles: dict[str, RollingWindow] = defaultdict(lambda: RollingWindow(6200))
         self.universe: list[dict[str, Any]] = []
         self.feeds: list[WSClient] = []
         self._lock = asyncio.Lock()
@@ -63,6 +66,7 @@ class MarketHub:
                 on_ticker=self.on_ticker,
                 on_trade=self.on_trade,
                 on_book=self.on_book,
+                on_bar=self.on_bar,
             )
             self.feeds.append(feed)
             await feed.start()
@@ -76,6 +80,7 @@ class MarketHub:
                 on_ticker=self.on_ticker,
                 on_trade=self.on_trade,
                 on_book=self.on_book,
+                on_bar=self.on_bar,
             )
             self.feeds.append(sim)
             await sim.start()
@@ -169,7 +174,14 @@ class MarketHub:
         if not tr.price:
             return
         self.trades.appendleft(tr)
+        self.tape.record(tr.symbol, tr.price, tr.qty, tr.side, tr.exchange, tr.ts)
         self.candles[tr.symbol].tick(tr.price, tr.ts, tr.qty)
+
+    async def on_bar(self, symbol: str, ts: float, o: float, h: float, l: float, c: float, v: float) -> None:
+        """Historical candle backfill — used by REST warm-up and the paper tape."""
+        if not symbol or c <= 0:
+            return
+        self.candles[symbol].push(ts, o, h, l, c, v)
 
     async def on_book(self, book: OrderBook) -> None:
         if not book.symbol:

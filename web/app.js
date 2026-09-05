@@ -5,8 +5,7 @@ let tickers = [];
 let selected = "BTC/USDT";
 let candles = [];
 let universe = [];
-let screener = { boards: {}, meta: {}, heatmap: [], alerts: [] };
-let boardKey = "alpha";
+let screener = { boards: {}, meta: {}, heatmap: [], alerts: [], summary: {} };
 
 function fmt(n, d = 2) {
   if (n == null || Number.isNaN(Number(n))) return "—";
@@ -67,10 +66,10 @@ function connect() {
       if (msg.events) renderJournal(msg.events);
       if (msg.screener) {
         screener = msg.screener;
-        renderScreener();
-        renderHeat();
+        if (typeof renderScreenerPro === "function") renderScreenerPro();
       }
       if (msg.alerts) renderAlerts(msg.alerts);
+      if (msg.rule_alerts && typeof renderRuleFeed === "function") renderRuleFeed(msg.rule_alerts);
     }
   };
   ws.onclose = () => {
@@ -118,6 +117,7 @@ function render() {
   renderTickers();
   renderPositions(s.positions || []);
   renderStrats(s.strategies || []);
+  if (typeof onProState === "function") onProState(s);
   if (s.alerts) renderAlerts(s.alerts);
   const t = tickers.find((x) => x.symbol === selected);
   if (t) {
@@ -262,92 +262,15 @@ function renderAlerts(rows) {
     .join("");
 }
 
-function renderScreener() {
-  const boards = screener.boards || {};
-  const meta = screener.meta || {};
-  const keys = Object.keys(meta).length ? Object.keys(meta) : Object.keys(boards);
-  $("screenerTabs").innerHTML = keys
-    .map((k) => {
-      const title = (meta[k] && meta[k].title) || k;
-      return `<button class="tab ${k === boardKey ? "on" : ""}" data-board="${k}">${title}</button>`;
-    })
-    .join("");
-  $("screenerTabs").querySelectorAll(".tab").forEach((btn) => {
-    btn.onclick = () => {
-      boardKey = btn.dataset.board;
-      const m = meta[boardKey] || {};
-      $("screenerMeta").textContent = m.blurb || boardKey;
-      renderScreener();
-    };
-  });
-  const rows = boards[boardKey] || [];
-  $("screenerBody").innerHTML = rows
-    .map((r) => {
-      const chg = Number(r.change_pct || 0);
-      return `<tr data-sym="${r.symbol}">
-        <td>${r.symbol}</td>
-        <td><b>${fmt(r.alpha, 1)}</b></td>
-        <td>${fmt(r.last)}</td>
-        <td class="${chg >= 0 ? "up" : "down"}">${pct(chg)}</td>
-        <td>${fmt(r.rsi, 1)}</td>
-        <td>${fmt(r.adx, 1)}</td>
-        <td>${fmt(r.vol_ratio, 2)}</td>
-        <td class="${r.rs_btc >= 0 ? "up" : "down"}">${fmt(r.rs_btc, 2)}</td>
-        <td class="bias-${r.bias}">${r.bias}</td>
-        <td><button class="btn tiny" data-watch="${r.symbol}">Watch</button></td>
-      </tr>`;
-    })
-    .join("");
-  $("screenerBody").querySelectorAll("tr").forEach((tr) => {
-    tr.onclick = (e) => {
-      if (e.target.dataset.watch) return;
-      select(tr.dataset.sym);
-      showView("overview");
-    };
-  });
-  $("screenerBody").querySelectorAll("[data-watch]").forEach((btn) => {
-    btn.onclick = (e) => {
-      e.stopPropagation();
-      fetch("/api/screener/watch", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ symbol: btn.dataset.watch }),
-      }).then(() => toast("Watching " + btn.dataset.watch));
-    };
-  });
-}
-
-function renderHeat() {
-  $("heat").innerHTML = (screener.heatmap || [])
-    .map((h) => {
-      const chg = Number(h.change_pct || 0);
-      const t = Math.max(-8, Math.min(8, chg));
-      const bg =
-        t >= 0
-          ? `rgba(61, 255, 154, ${0.12 + t / 18})`
-          : `rgba(255, 93, 115, ${0.12 + Math.abs(t) / 18})`;
-      return `<div class="cell" data-sym="${h.symbol}" style="background:${bg}">
-        <div><b>${h.symbol.replace("/USDT", "")}</b></div>
-        <div class="${chg >= 0 ? "up" : "down"}">${pct(chg)}</div>
-      </div>`;
-    })
-    .join("");
-  $("heat").querySelectorAll(".cell").forEach((c) => {
-    c.onclick = () => {
-      select(c.dataset.sym);
-      showView("overview");
-    };
-  });
-}
-
 function renderStrats(rows) {
   $("stratGrid").innerHTML = (rows || [])
     .map((s) => {
       const pnl = Number(s.pnl || 0);
-      return `<div class="strat ${s.enabled ? "on" : "off"}" data-name="${s.name}">
-        <div class="fam">${s.family || "core"}</div>
+      return `<div class="strat ${s.enabled ? "on" : "off"} ${s.custom ? "mine" : ""}" data-name="${s.name}">
+        <div class="fam">${s.custom ? "custom" : s.family || "core"}</div>
         <div class="nm">${s.title || s.name}</div>
         <div class="muted">weight ${fmt(s.weight, 2)} · <span class="${pnl >= 0 ? "up" : "down"}">${fmt(pnl, 2)}</span></div>
+        <div class="muted">${s.fires ? s.fires + " signals" : "idle"}</div>
       </div>`;
     })
     .join("");
@@ -538,3 +461,18 @@ setInterval(() => {
     })
     .catch(() => {});
 }, 4000);
+
+
+// bridge used by pro.js
+window.FML = {
+  get state() { return state; },
+  get selected() { return selected; },
+  get screener() { return screener; },
+  get tickers() { return tickers; },
+  select,
+  showView,
+  toast,
+  fmt,
+  pct,
+  ago,
+};

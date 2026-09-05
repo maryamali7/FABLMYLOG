@@ -112,6 +112,13 @@ class Position:
     peak: float = 0.0
     scaled: bool = False
     atr: float = 0.0
+    trail_pct: float = 0.0
+    spec_id: str = ""
+    confidence: float = 0.0
+    partials_taken: int = 0
+    risk: float = 0.0
+    quality: float = 0.0
+    live_order: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)

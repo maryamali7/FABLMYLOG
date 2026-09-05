@@ -23,9 +23,18 @@
       <nav>
         <button class="nav on" data-view="overview">Overview</button>
         <button class="nav" data-view="trade">Trade</button>
+        <button class="nav" data-view="desk">Trade desk</button>
+        <button class="nav" data-view="volume">Volume dots</button>
+        <button class="nav" data-view="risk">Risk &amp; portfolio</button>
         <button class="nav" data-view="markets">Markets</button>
-        <button class="nav" data-view="screeners">Screeners</button>
-        <button class="nav" data-view="strategies">Strategies</button>
+        <button class="nav" data-view="universe">Universe</button>
+        <button class="nav" data-view="bot">Bot control</button>
+        <button class="nav" data-view="screeners">Screener Pro</button>
+        <button class="nav" data-view="mtf">Multi-TF &amp; forecast</button>
+        <button class="nav" data-view="builder">Strategy builder</button>
+        <button class="nav" data-view="strategies">Strategy desk</button>
+        <button class="nav" data-view="alerts">Alert rules</button>
+        <button class="nav" data-view="analytics">Analytics</button>
         <button class="nav" data-view="journal">Journal</button>
       </nav>
       <div class="side-foot">
@@ -121,6 +130,240 @@
         </div>
       </section>
 
+      <!-- ================= TRADE DESK ================= -->
+      <section class="view" data-view="desk">
+        <div class="desk-head card">
+          <div class="desk-sym">
+            <input id="dkSymbol" list="dkList" value="BTC/USDT" spellcheck="false" />
+            <datalist id="dkList"></datalist>
+            <div class="desk-quote">
+              <b id="dkLast">—</b>
+              <span id="dkChg" class="pill dim">—</span>
+              <span class="muted small" id="dkSpread">spread —</span>
+              <span class="muted small" id="dkVenue"></span>
+            </div>
+          </div>
+          <div class="desk-acct" id="dkAcct"></div>
+          <div class="desk-quick">
+            <label class="hand-off"><input type="checkbox" id="dkManage" /> robot may close desk positions</label>
+            <button class="btn tiny" id="dkFlatten">Flatten symbol</button>
+            <button class="btn tiny" id="dkCancelAll">Cancel all</button>
+            <button class="btn tiny ghost" id="dkPalette">⌘K commands</button>
+          </div>
+        </div>
+
+        <div class="desk-grid">
+          <!-- order ticket -->
+          <div class="card">
+            <div class="card-h"><h2>Order ticket</h2><span class="sub" id="dkTicketSub">paper</span></div>
+            <div class="tabs side-tabs" id="dkSide">
+              <button class="tab on" data-side="buy">BUY</button>
+              <button class="tab" data-side="sell">SELL</button>
+            </div>
+            <div class="tabs" id="dkType">
+              <button class="tab on" data-type="market">Market</button>
+              <button class="tab" data-type="limit">Limit</button>
+              <button class="tab" data-type="stop">Stop</button>
+              <button class="tab" data-type="stop_limit">Stop-limit</button>
+              <button class="tab" data-type="trailing_stop">Trail</button>
+            </div>
+
+            <div class="fld" id="dkPriceWrap"><label>Limit price</label>
+              <input id="dkPrice" type="number" step="any" placeholder="0.00" /></div>
+            <div class="fld" id="dkStopWrap"><label>Stop trigger</label>
+              <input id="dkStop" type="number" step="any" placeholder="0.00" /></div>
+            <div class="fld" id="dkTrailWrap"><label>Trail %</label>
+              <input id="dkTrail" type="number" step="0.1" placeholder="2.0" /></div>
+
+            <div class="tabs" id="dkQtyMode">
+              <button class="tab on" data-mode="base">Base</button>
+              <button class="tab" data-mode="quote">$</button>
+              <button class="tab" data-mode="equity_pct">% equity</button>
+              <button class="tab" data-mode="risk_pct">Risk %</button>
+            </div>
+            <div class="fld"><label id="dkQtyLabel">Quantity</label>
+              <input id="dkQty" type="number" step="any" placeholder="0.0" /></div>
+            <div class="qty-quick" id="dkQtyQuick">
+              <button class="mini" data-frac="0.1">10%</button>
+              <button class="mini" data-frac="0.25">25%</button>
+              <button class="mini" data-frac="0.5">50%</button>
+              <button class="mini" data-frac="1">Max</button>
+            </div>
+
+            <div class="grid2">
+              <div class="fld"><label>Time in force</label>
+                <select id="dkTif"><option>gtc</option><option>ioc</option><option>fok</option><option>day</option></select></div>
+              <div class="fld"><label>Tag</label><input id="dkLabel" placeholder="manual" /></div>
+            </div>
+            <div class="flags">
+              <label><input type="checkbox" id="dkReduce" /> reduce only</label>
+              <label><input type="checkbox" id="dkPost" /> post only</label>
+              <label><input type="checkbox" id="dkBracket" /> attach bracket</label>
+            </div>
+            <div id="dkBracketBox" class="bracket-box" style="display:none">
+              <div class="grid2">
+                <div class="fld"><label>Stop loss</label><input id="dkSl" type="number" step="any" /></div>
+                <div class="fld"><label>Take profit</label><input id="dkTp" type="number" step="any" /></div>
+              </div>
+              <div class="fld"><label>Bracket trail % (optional)</label><input id="dkBt" type="number" step="0.1" /></div>
+            </div>
+
+            <div class="preview" id="dkPreview"></div>
+            <div class="ticket-btns">
+              <button class="btn buy" id="dkSubmit">Place buy order</button>
+            </div>
+            <p class="hint" id="dkHint">Paper fills against the live book. Risk-based sizing needs a stop.</p>
+          </div>
+
+          <!-- depth ladder -->
+          <div class="card">
+            <div class="card-h"><h2>Depth</h2><span class="sub">click a price to load it</span></div>
+            <div class="ladder" id="dkLadder"></div>
+          </div>
+
+          <!-- position + working orders -->
+          <div class="stack">
+            <div class="card">
+              <div class="card-h"><h2>Position</h2></div>
+              <div id="dkPosition"></div>
+            </div>
+            <div class="card">
+              <div class="card-h"><h2>Working orders</h2><span class="sub" id="dkWorkSub">0</span></div>
+              <div class="table-wrap">
+                <table class="data">
+                  <thead><tr><th>Sym</th><th>Side</th><th>Type</th><th>Qty</th><th>Price</th><th>Trig</th><th>TIF</th><th>State</th><th></th></tr></thead>
+                  <tbody id="dkWorking"></tbody>
+                </table>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-h"><h2>Time &amp; sales</h2></div>
+              <div id="dkTape" class="list tape"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= VOLUME DOTS ================= -->
+      <section class="view" data-view="volume">
+        <div class="card vd-head">
+          <div class="vd-sym">
+            <input id="vdSymbol" list="vdList" value="BTC/USDT" spellcheck="false" />
+            <datalist id="vdList"></datalist>
+            <div class="desk-quote">
+              <b id="vdLast">—</b>
+              <span id="vdChg" class="pill dim">—</span>
+              <span class="muted small" id="vdSource"></span>
+            </div>
+          </div>
+          <div class="tabs" id="vdTf">
+            <button class="tab" data-tf="5s">5s</button>
+            <button class="tab" data-tf="15s">15s</button>
+            <button class="tab" data-tf="30s">30s</button>
+            <button class="tab on" data-tf="1m">1m</button>
+            <button class="tab" data-tf="5m">5m</button>
+            <button class="tab" data-tf="15m">15m</button>
+            <button class="tab" data-tf="1h">1h</button>
+          </div>
+          <div class="vd-opts">
+            <select id="vdVenue" class="mini"><option value="">all exchanges</option></select>
+            <label><input type="checkbox" id="vdDots" checked /> dots</label>
+            <label><input type="checkbox" id="vdCvd" checked /> CVD</label>
+            <label><input type="checkbox" id="vdLive" checked /> live</label>
+          </div>
+        </div>
+
+        <div class="kpis" id="vdKpis"></div>
+
+        <div class="vd-grid">
+          <div class="card vd-chart-card">
+            <div class="card-h">
+              <h2>Volume dots</h2>
+              <span class="sub" id="vdChartSub">every dot is one bar of consolidated tape</span>
+            </div>
+            <div id="vdChart" class="vd-chart"></div>
+            <div class="vd-legend">
+              <span><i class="dot up"></i> buyers were the aggressors</span>
+              <span><i class="dot down"></i> sellers were the aggressors</span>
+              <span><i class="dot big"></i> size = volume vs the window</span>
+              <span><i class="dot ring"></i> ringed = absorption or divergence</span>
+            </div>
+            <div id="vdHover" class="vd-hover"></div>
+          </div>
+
+          <div class="stack">
+            <div class="card">
+              <div class="card-h"><h2>Next move</h2><span class="sub" id="vdReadSub"></span></div>
+              <div id="vdRead"></div>
+            </div>
+            <div class="card">
+              <div class="card-h"><h2>By exchange</h2><span class="sub">who is buying, who is selling</span></div>
+              <div class="table-wrap">
+                <table class="data">
+                  <thead><tr><th>Venue</th><th>Share</th><th>Buy</th><th>Sell</th><th>Delta</th></tr></thead>
+                  <tbody id="vdVenues"></tbody>
+                </table>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-h"><h2>Size prints</h2><span class="sub">outsized trades on the tape</span></div>
+              <div id="vdPrints" class="list tape"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= RISK & PORTFOLIO ================= -->
+      <section class="view" data-view="risk">
+        <div class="kpis" id="pfKpis"></div>
+        <div class="alerts" id="pfWarn"></div>
+        <div class="two">
+          <div class="card">
+            <div class="card-h"><h2>Exposure</h2><span class="sub" id="pfExpSub"></span></div>
+            <div class="table-wrap">
+              <table class="data">
+                <thead><tr><th>Symbol</th><th>Notional</th><th>% equity</th><th>Weight</th><th>Unreal</th></tr></thead>
+                <tbody id="pfExposure"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-h"><h2>Open risk</h2><span class="sub" id="pfRiskSub"></span></div>
+            <div class="table-wrap">
+              <table class="data">
+                <thead><tr><th>Symbol</th><th>Stop</th><th>Risk $</th><th>% equity</th><th>R left</th></tr></thead>
+                <tbody id="pfRisk"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        <div class="two" style="margin-top:16px">
+          <div class="card">
+            <div class="card-h"><h2>Correlation</h2><span class="sub" id="pfCorrSub"></span></div>
+            <div id="pfCorr" class="corr-wrap"></div>
+          </div>
+          <div class="card">
+            <div class="card-h"><h2>Value at risk</h2><span class="sub">daily, historical</span></div>
+            <div id="pfVar"></div>
+          </div>
+        </div>
+        <div class="two" style="margin-top:16px">
+          <div class="card">
+            <div class="card-h"><h2>R distribution</h2><span class="sub" id="pfRSub"></span></div>
+            <div id="pfRDist" class="hist"></div>
+          </div>
+          <div class="card">
+            <div class="card-h"><h2>Playbook tags</h2><span class="sub">tag trades in the journal</span></div>
+            <div class="table-wrap">
+              <table class="data">
+                <thead><tr><th>Tag</th><th>Trades</th><th>Win</th><th>Net</th><th>Avg</th></tr></thead>
+                <tbody id="pfTags"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <section class="view" data-view="markets">
         <div class="card">
           <div class="card-h"><h2>Watchlist</h2></div>
@@ -139,25 +382,529 @@
         </div>
       </section>
 
+      <!-- ================= MULTI-VENUE UNIVERSE ================= -->
+      <section class="view" data-view="universe">
+        <div class="card">
+          <div class="card-h">
+            <div>
+              <h2>Instrument universe</h2>
+              <p class="sub" id="uniMeta">Binance · Bybit · OKX · MEXC — spot and futures</p>
+            </div>
+            <div class="row-btns">
+              <button class="btn tiny" id="uniReload">Refresh catalogs</button>
+              <button class="btn tiny" id="uniCsv">Export CSV</button>
+            </div>
+          </div>
+          <div id="uniBanner"></div>
+          <div class="metric-grid" id="uniStats"></div>
+          <div class="table-wrap venue-table">
+            <table class="data">
+              <thead><tr><th>Venue</th><th>Spot</th><th>Futures</th><th>Total</th><th>Coins</th><th>24h volume</th></tr></thead>
+              <tbody id="uniVenues"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-h">
+            <div><h2>Browse</h2><p class="sub" id="uniCount">—</p></div>
+            <div class="row-btns">
+              <button class="btn tiny" id="uniWatchTop">Watch top 5</button>
+            </div>
+          </div>
+          <div class="chips" id="uniPresetChips"></div>
+          <div class="chips" id="uniVenueChips"></div>
+          <div class="chips" id="uniMarketChips"></div>
+          <div class="filter-bar">
+            <input id="uniSearch" class="mini" placeholder="Search coin or pair…" />
+            <select id="uniQuote" class="mini">
+              <option value="">Any quote</option>
+              <option value="USDT" selected>USDT</option>
+              <option value="USDC">USDC</option>
+              <option value="BTC">BTC</option>
+              <option value="ETH">ETH</option>
+            </select>
+            <select id="uniSort" class="mini">
+              <option value="volume">Volume</option>
+              <option value="change">Top gainers</option>
+              <option value="losers">Top losers</option>
+              <option value="funding">Funding</option>
+              <option value="open_interest">Open interest</option>
+              <option value="price">Price</option>
+              <option value="symbol">Symbol</option>
+            </select>
+            <select id="uniMode" class="mini">
+              <option value="instruments">Per listing</option>
+              <option value="coins">Per coin</option>
+            </select>
+            <input id="uniLimit" class="mini tiny-num" type="number" value="60" min="10" max="500" />
+            <input id="uniChangeMin" class="mini tiny-num" type="number" step="0.5" placeholder="24h ≥ %" />
+            <input id="uniMinVol" class="mini tiny-num" type="number" step="100000" placeholder="vol ≥ $" />
+            <button class="btn tiny" id="uniClear">Clear</button>
+          </div>
+          <div class="table-wrap">
+            <table class="data">
+              <thead><tr id="uniHead"></tr></thead>
+              <tbody id="uniBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="fc-grid">
+          <div class="card">
+            <div class="card-h">
+              <div><h2>Cross-venue spread</h2><p class="sub">Same coin, different price — widest gaps first</p></div>
+              <select id="uniArbMarket" class="mini">
+                <option value="spot">Spot</option>
+                <option value="futures">Futures</option>
+              </select>
+            </div>
+            <div class="table-wrap">
+              <table class="data">
+                <thead><tr><th>Coin</th><th>Buy</th><th>Sell</th><th>Spread</th><th>Venues</th></tr></thead>
+                <tbody id="uniArb"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-h">
+              <div><h2>Funding &amp; basis</h2><p class="sub">Perp funding extremes and premium to spot</p></div>
+              <select id="uniFundSide" class="mini">
+                <option value="longs_pay">Longs pay</option>
+                <option value="shorts_pay">Shorts pay</option>
+                <option value="premium">Premium to spot</option>
+                <option value="discount">Discount to spot</option>
+              </select>
+            </div>
+            <div class="table-wrap">
+              <table class="data">
+                <thead><tr><th>Perp</th><th>Venue</th><th>Funding</th><th>APR</th><th>Basis</th></tr></thead>
+                <tbody id="uniFunding"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        <div class="card" style="margin-top:16px">
+          <div class="card-h">
+            <div><h2 id="uniBoardTitle">Cash-and-carry</h2><p class="sub" id="uniBoardSub">Buy spot on the cheapest venue, short the perp that pays the most</p></div>
+            <div class="tabs" id="uniBoardTabs">
+              <button class="tab on" data-board="carry">Carry</button>
+              <button class="tab" data-board="movers">Movers</button>
+              <button class="tab" data-board="exclusives">Exclusives</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="data">
+              <thead><tr id="uniBoardHead"></tr></thead>
+              <tbody id="uniBoardBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= COIN DETAIL DRAWER ================= -->
+      <div class="drawer-back" id="uniDrawerBack">
+        <div class="drawer" id="uniDrawer">
+          <div class="card-h">
+            <div><h2 id="uniDrawerTitle">—</h2><p class="sub" id="uniDrawerSub"></p></div>
+            <div class="row-btns">
+              <button class="btn tiny" id="uniDrawerWatch">Watch</button>
+              <button class="btn tiny" id="uniDrawerClose">Close</button>
+            </div>
+          </div>
+          <div class="metric-grid" id="uniDrawerStats"></div>
+          <div class="table-wrap">
+            <table class="data">
+              <thead><tr><th>Venue</th><th>Market</th><th>Contract</th><th>Price</th><th>24h</th><th>Volume</th><th>Funding</th><th>OI</th></tr></thead>
+              <tbody id="uniDrawerBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- ================= BOT CONTROL ================= -->
+      <section class="view" data-view="bot">
+        <div class="card">
+          <div class="card-h">
+            <div><h2>Coins the bot trades</h2><p class="sub" id="selSub">Analysis watches everything — trading only touches what you pick here</p></div>
+            <div class="row-btns">
+              <button class="btn tiny" id="selAll">Select all</button>
+              <button class="btn tiny" id="selNone">Clear</button>
+            </div>
+          </div>
+          <div class="tabs" id="selModes">
+            <button class="tab on" data-mode="selected">Only my picks</button>
+            <button class="tab" data-mode="all">Whole watchlist</button>
+            <button class="tab" data-mode="auto">Auto top movers</button>
+          </div>
+          <div class="filter-bar" id="selAutoBar" style="display:none">
+            <label class="muted">Top</label>
+            <input id="selTopN" class="mini tiny-num" type="number" min="1" max="25" value="5" />
+            <select id="selMetric" class="mini">
+              <option value="score">by score</option>
+              <option value="alpha">by alpha</option>
+              <option value="momentum">by momentum</option>
+              <option value="volume">by volume</option>
+            </select>
+            <input id="selMinVol" class="mini" type="number" placeholder="min 24h volume $" />
+            <span class="muted" id="selBasket"></span>
+          </div>
+          <div class="table-wrap">
+            <table class="data">
+              <thead><tr><th>Trade</th><th>Coin</th><th>Price</th><th>24h</th><th>Score</th><th>Size ×</th><th>Status</th></tr></thead>
+              <tbody id="selBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="fc-grid">
+          <div class="card">
+            <div class="card-h">
+              <div><h2>Edge engine</h2><p class="sub">Entry quality, sizing and exits — the win-rate knobs</p></div>
+              <div class="row-btns">
+                <button class="btn tiny" id="edgeSave">Save</button>
+                <button class="btn tiny" id="edgeReset">Defaults</button>
+              </div>
+            </div>
+            <div class="metric-grid" id="edgeKpis"></div>
+            <div id="edgeForm" class="edge-form"></div>
+          </div>
+          <div class="card">
+            <div class="card-h">
+              <div><h2>Why no trade?</h2><p class="sub">Every rejected signal, with the reason</p></div>
+              <button class="btn tiny" id="edgeRefresh">Refresh</button>
+            </div>
+            <div class="table-wrap">
+              <table class="data">
+                <thead><tr><th>Reason</th><th>Count</th></tr></thead>
+                <tbody id="edgeBlocks"></tbody>
+              </table>
+            </div>
+            <div class="table-wrap" style="margin-top:10px">
+              <table class="data">
+                <thead><tr><th>When</th><th>Coin</th><th>Score</th><th>Blocked by</th></tr></thead>
+                <tbody id="edgeRejects"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="fc-grid">
+          <div class="card">
+            <div class="card-h">
+              <div><h2>Exchange API keys</h2><p class="sub" id="keyNote">Stored encrypted on this machine — never shown again after saving</p></div>
+            </div>
+            <div class="filter-bar">
+              <select id="keyVenue" class="mini"></select>
+              <input id="keyKey" class="mini" placeholder="API key" autocomplete="off" />
+              <input id="keySecret" class="mini" type="password" placeholder="API secret" autocomplete="new-password" />
+              <input id="keyPass" class="mini" type="password" placeholder="passphrase (if required)" autocomplete="new-password" />
+              <button class="btn tiny" id="keySave">Save key</button>
+            </div>
+            <div class="table-wrap">
+              <table class="data">
+                <thead><tr><th>Venue</th><th>Key</th><th>Orders</th><th>Last test</th><th></th></tr></thead>
+                <tbody id="keyBody"></tbody>
+              </table>
+            </div>
+            <div id="liveBox" class="fb" style="margin-top:12px"></div>
+            <div class="filter-bar">
+              <select id="liveVenue" class="mini"></select>
+              <input id="liveMax" class="mini tiny-num" type="number" value="50" min="1" />
+              <input id="liveConfirm" class="mini" placeholder='type ARM LIVE' />
+              <button class="btn tiny danger" id="liveArm">Arm live trading</button>
+              <button class="btn tiny" id="liveDisarm">Disarm</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-h">
+              <div><h2>24/7 runtime</h2><p class="sub" id="upSub">Watchdog, daily reset and maintenance window</p></div>
+              <div class="row-btns">
+                <button class="btn tiny" id="upSave">Save</button>
+                <button class="btn tiny" id="upCheck">Run check</button>
+              </div>
+            </div>
+            <div class="metric-grid" id="upKpis"></div>
+            <div id="upForm" class="edge-form"></div>
+            <div class="table-wrap" style="margin-top:10px">
+              <table class="data">
+                <thead><tr><th>When</th><th>Event</th><th>Detail</th></tr></thead>
+                <tbody id="upEvents"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= SCREENER PRO ================= -->
       <section class="view" data-view="screeners">
         <div class="card">
           <div class="card-h">
-            <h2>Crypto screeners</h2>
-            <span class="sub" id="screenerMeta">Composite alpha across the watchlist</span>
+            <div>
+              <h2>Screener Pro</h2>
+              <p class="sub" id="screenerMeta">40+ factors, custom filters, presets and CSV export</p>
+            </div>
+            <div class="row-btns">
+              <button class="btn tiny" id="scnModeBoards">Boards</button>
+              <button class="btn tiny primary" id="scnModeQuery">Custom query</button>
+              <button class="btn tiny" id="scnExport">Export CSV</button>
+            </div>
           </div>
-          <div class="tabs" id="screenerTabs"></div>
+
+          <div class="breadth" id="scnSummary"></div>
+
+          <div id="scnBoardsWrap">
+            <div class="tabs" id="screenerTabs"></div>
+          </div>
+
+          <div id="scnQueryWrap" style="display:none">
+            <div class="tabs" id="scnPresets"></div>
+            <div class="filter-bar">
+              <input id="scnSearch" class="mini" placeholder="Filter symbol…" />
+              <select id="scnMatch" class="mini">
+                <option value="all">Match ALL</option>
+                <option value="any">Match ANY</option>
+                <option value="none">Match NONE</option>
+              </select>
+              <select id="scnSort" class="mini"></select>
+              <select id="scnDir" class="mini">
+                <option value="desc">High → low</option>
+                <option value="asc">Low → high</option>
+              </select>
+              <input id="scnLimit" class="mini tiny-num" type="number" value="50" min="5" max="300" />
+              <button class="btn tiny" id="scnAddFilter">+ Condition</button>
+              <button class="btn tiny primary" id="scnRun">Run screen</button>
+              <button class="btn tiny" id="scnClear">Clear</button>
+            </div>
+            <div id="scnFilters" class="cond-list"></div>
+            <p class="hint" id="scnStatus">Add conditions or pick a preset, then run the screen.</p>
+          </div>
+
           <div class="table-wrap">
             <table class="data">
-              <thead>
-                <tr>
-                  <th>Symbol</th><th>Alpha</th><th>Last</th><th>Chg</th>
-                  <th>RSI</th><th>ADX</th><th>Vol×</th><th>vs BTC</th><th>Bias</th><th></th>
-                </tr>
-              </thead>
+              <thead><tr id="screenerHead"></tr></thead>
               <tbody id="screenerBody"></tbody>
             </table>
           </div>
           <div class="heat" id="heat"></div>
+        </div>
+      </section>
+
+      <!-- ================= MULTI-TIMEFRAME + FORECAST ================= -->
+      <section class="view" data-view="mtf">
+        <div class="card">
+          <div class="card-h">
+            <div>
+              <h2>Multi-timeframe analysis</h2>
+              <p class="sub" id="mtfMeta">RSI, trend, ADX and rating on every timeframe from 1m to 1w</p>
+            </div>
+            <div class="row-btns">
+              <select id="mtfSymbol" class="mini"></select>
+              <button class="btn tiny" id="mtfRefresh">Refresh</button>
+              <button class="btn tiny" id="mtfWatch">Watch</button>
+            </div>
+          </div>
+
+          <div class="tf-strip" id="mtfStrip"></div>
+
+          <div class="align-wrap">
+            <div class="align-meter">
+              <div class="align-bar"><span id="mtfAlignFill"></span><i id="mtfAlignZero"></i></div>
+              <div class="align-legend"><span>bearish</span><span>neutral</span><span>bullish</span></div>
+            </div>
+            <div class="align-facts" id="mtfAlignFacts"></div>
+          </div>
+        </div>
+
+        <div class="fc-grid">
+          <div class="card">
+            <div class="card-h">
+              <div>
+                <h2>Next move forecast</h2>
+                <p class="sub" id="fcMeta">Ensemble of trend, mean-reversion, analog, drift, flow and volatility models</p>
+              </div>
+              <div class="row-btns">
+                <select id="fcTf" class="mini"></select>
+                <button class="btn tiny primary" id="fcRun">Predict</button>
+              </div>
+            </div>
+            <div class="fc-head" id="fcHead"></div>
+            <canvas id="fcChart" height="200"></canvas>
+            <div class="fc-models" id="fcModels"></div>
+            <div class="fc-why" id="fcWhy"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-h"><h2>Key levels</h2></div>
+            <div class="lvl-list" id="fcLevels"></div>
+            <div class="card-h" style="margin-top:14px"><h2>Regime</h2></div>
+            <div id="fcRegime" class="regime-box"></div>
+          </div>
+        </div>
+
+        <div class="fc-grid">
+          <div class="card">
+            <div class="card-h">
+              <div><h2>Forecast leaders</h2><p class="sub">Highest-edge predictions across the watchlist</p></div>
+            </div>
+            <div class="table-wrap">
+              <table class="data">
+                <thead><tr><th>Symbol</th><th>Dir</th><th>Prob&nbsp;up</th><th>Exp move</th><th>Conf</th><th>R:R</th><th>Reason</th></tr></thead>
+                <tbody id="fcBoard"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-h">
+              <div><h2>Alignment matrix</h2><p class="sub">RSI per timeframe — click a row to load it</p></div>
+            </div>
+            <div class="table-wrap">
+              <table class="data">
+                <thead><tr id="mtfMatrixHead"></tr></thead>
+                <tbody id="mtfMatrix"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-h">
+            <div>
+              <h2>Prediction scoreboard</h2>
+              <p class="sub" id="scoreMeta">Every forecast is graded against the real price once its horizon elapses</p>
+            </div>
+          </div>
+          <div class="metric-grid" id="scoreKpis"></div>
+          <div class="score-grid">
+            <div>
+              <h3 class="mini-h">Model accuracy</h3>
+              <div class="table-wrap">
+                <table class="data">
+                  <thead><tr><th>Model</th><th>Calls</th><th>Hit rate</th><th>Edge</th></tr></thead>
+                  <tbody id="scoreModels"></tbody>
+                </table>
+              </div>
+            </div>
+            <div>
+              <h3 class="mini-h">Calibration</h3>
+              <div id="scoreCal" class="cal-list"></div>
+            </div>
+            <div>
+              <h3 class="mini-h">Awaiting settlement</h3>
+              <div id="scorePending" class="list small-list"></div>
+            </div>
+          </div>
+          <h3 class="mini-h">Last graded calls</h3>
+          <div class="table-wrap">
+            <table class="data">
+              <thead><tr><th>Symbol</th><th>TF</th><th>Call</th><th>Prob</th><th>Expected</th><th>Actual</th><th>Result</th></tr></thead>
+              <tbody id="scoreRecent"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= STRATEGY BUILDER ================= -->
+      <section class="view" data-view="builder">
+        <div class="builder-grid">
+          <div class="card">
+            <div class="card-h">
+              <h2>My strategies</h2>
+              <button class="btn tiny primary" id="bldNew">+ New</button>
+            </div>
+            <select id="bldTemplate" class="mini wide">
+              <option value="">Start from a template…</option>
+            </select>
+            <div id="bldList" class="list tall"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-h">
+              <div>
+                <h2 id="bldTitle">Strategy editor</h2>
+                <p class="sub">Compose entry / exit logic from indicators — no code.</p>
+              </div>
+              <span class="badge dim" id="bldId">unsaved</span>
+            </div>
+
+            <div class="grid2">
+              <label class="fld">Name<input id="bldName" placeholder="Squeeze breakout" /></label>
+              <label class="fld">Tags<input id="bldTags" placeholder="breakout, volatility" /></label>
+            </div>
+            <label class="fld">Description<input id="bldDesc" placeholder="What is the edge?" /></label>
+            <div class="grid4">
+              <label class="fld">Side
+                <select id="bldSide">
+                  <option value="long">Long</option>
+                  <option value="short">Short</option>
+                  <option value="both">Both</option>
+                </select>
+              </label>
+              <label class="fld">Confidence<input id="bldConf" type="number" step="0.01" min="0.1" max="1" value="0.66" /></label>
+              <label class="fld">Weight<input id="bldWeight" type="number" step="0.05" min="0.05" max="3" value="1" /></label>
+              <label class="fld">Cooldown (s)<input id="bldCooldown" type="number" step="30" min="0" value="180" /></label>
+            </div>
+            <div class="grid4">
+              <label class="fld">Stop %<input id="bldStop" type="number" step="0.1" placeholder="1.8" /></label>
+              <label class="fld">Target %<input id="bldTake" type="number" step="0.1" placeholder="3.5" /></label>
+              <label class="fld">Trail %<input id="bldTrail" type="number" step="0.1" placeholder="1.2" /></label>
+              <label class="fld">Symbols<input id="bldSymbols" placeholder="blank = whole watchlist" /></label>
+            </div>
+
+            <div class="rules-block">
+              <div class="rules-h">
+                <h3>Entry conditions</h3>
+                <select id="bldEntryOp" class="mini">
+                  <option value="all">Match ALL</option>
+                  <option value="any">Match ANY</option>
+                  <option value="none">Match NONE</option>
+                </select>
+                <button class="btn tiny" data-add="entry">+ Condition</button>
+              </div>
+              <div id="bldEntry" class="cond-list"></div>
+            </div>
+
+            <div class="rules-block">
+              <div class="rules-h">
+                <h3>Exit conditions <span class="muted">(optional)</span></h3>
+                <select id="bldExitOp" class="mini">
+                  <option value="any">Match ANY</option>
+                  <option value="all">Match ALL</option>
+                </select>
+                <button class="btn tiny" data-add="exit">+ Condition</button>
+              </div>
+              <div id="bldExit" class="cond-list"></div>
+            </div>
+
+            <div class="row-btns">
+              <button class="btn" id="bldPreview">Validate &amp; preview</button>
+              <button class="btn primary" id="bldSave">Save &amp; arm</button>
+              <button class="btn" id="bldBacktest">Backtest</button>
+              <button class="btn danger" id="bldDelete">Delete</button>
+            </div>
+            <div id="bldFeedback" class="feedback"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-h"><h2>Backtest lab</h2></div>
+            <div class="grid2">
+              <label class="fld">Symbol<input id="btSymbol" value="BTC/USDT" /></label>
+              <label class="fld">Bars<input id="btBars" type="number" value="600" min="120" max="1000" /></label>
+            </div>
+            <div class="grid2">
+              <label class="fld">Size %<input id="btSize" type="number" value="25" min="1" max="100" /></label>
+              <label class="fld">Fees bps<input id="btFees" type="number" value="10" min="0" max="100" /></label>
+            </div>
+            <label class="fld">Also test symbols (portfolio)<input id="btBasket" placeholder="ETH/USDT, SOL/USDT" /></label>
+            <div class="row-btns">
+              <button class="btn tiny primary" id="btRun">Run backtest</button>
+              <button class="btn tiny" id="btBasketRun">Run basket</button>
+            </div>
+            <div id="btMetrics" class="metric-grid"></div>
+            <canvas id="btChart" height="150"></canvas>
+            <div id="btTrades" class="list"></div>
+          </div>
         </div>
       </section>
 
@@ -169,17 +916,153 @@
           </div>
           <div class="strat-grid" id="stratGrid"></div>
         </div>
+        <div class="card" style="margin-top:16px">
+          <div class="card-h">
+            <h2>Risk console</h2>
+            <span class="sub">Live-tune the gate — changes apply on the next loop</span>
+          </div>
+          <div id="riskGrid" class="grid4"></div>
+          <div class="row-btns">
+            <button class="btn tiny primary" id="riskSave">Apply risk</button>
+            <button class="btn tiny" id="riskResume">Clear halt</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= ALERT RULES ================= -->
+      <section class="view" data-view="alerts">
+        <div class="builder-grid">
+          <div class="card">
+            <div class="card-h">
+              <h2>Alert rules</h2>
+              <button class="btn tiny primary" id="alNew">+ New</button>
+            </div>
+            <select id="alTemplate" class="mini wide">
+              <option value="">Start from a template…</option>
+            </select>
+            <div id="alList" class="list tall"></div>
+          </div>
+          <div class="card">
+            <div class="card-h"><h2>Rule editor</h2><span class="badge dim" id="alId">unsaved</span></div>
+            <div class="grid2">
+              <label class="fld">Name<input id="alName" placeholder="Alpha breakout" /></label>
+              <label class="fld">Severity
+                <select id="alSeverity">
+                  <option value="info">Info</option>
+                  <option value="warn">Warn</option>
+                  <option value="critical">Critical</option>
+                </select>
+              </label>
+            </div>
+            <label class="fld">Message <span class="muted">{symbol} {price} {alpha}</span><input id="alMessage" placeholder="{symbol} alpha {alpha} breaking out" /></label>
+            <div class="grid4">
+              <label class="fld">Cooldown (s)<input id="alCooldown" type="number" value="300" min="30" /></label>
+              <label class="fld">Symbols<input id="alSymbols" placeholder="blank = all" /></label>
+              <label class="fld">Auto-watch
+                <select id="alAutoWatch"><option value="no">No</option><option value="yes">Yes</option></select>
+              </label>
+              <label class="fld">Webhook<input id="alWebhook" placeholder="https://…" /></label>
+            </div>
+            <div class="rules-block">
+              <div class="rules-h">
+                <h3>Conditions</h3>
+                <select id="alOp" class="mini">
+                  <option value="all">Match ALL</option>
+                  <option value="any">Match ANY</option>
+                </select>
+                <button class="btn tiny" data-add="alert">+ Condition</button>
+              </div>
+              <div id="alRules" class="cond-list"></div>
+            </div>
+            <div class="row-btns">
+              <button class="btn primary" id="alSave">Save rule</button>
+              <button class="btn danger" id="alDelete">Delete</button>
+            </div>
+            <div id="alFeedback" class="feedback"></div>
+          </div>
+          <div class="card">
+            <div class="card-h"><h2>Triggered</h2></div>
+            <div id="alHistory" class="list tall"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= ANALYTICS ================= -->
+      <section class="view" data-view="analytics">
+        <div class="card">
+          <div class="card-h">
+            <h2>Performance analytics</h2>
+            <button class="btn tiny" id="anRefresh">Refresh</button>
+          </div>
+          <div id="anOverall" class="metric-grid"></div>
+          <canvas id="anChart" height="160"></canvas>
+        </div>
+        <div class="two" style="margin-top:14px">
+          <div class="card">
+            <div class="card-h"><h2>By strategy</h2></div>
+            <div class="table-wrap"><table class="data"><thead><tr>
+              <th>Strategy</th><th>Trades</th><th>Win %</th><th>Net</th><th>PF</th><th>Expectancy</th>
+            </tr></thead><tbody id="anStrategy"></tbody></table></div>
+          </div>
+          <div class="card">
+            <div class="card-h"><h2>By symbol</h2></div>
+            <div class="table-wrap"><table class="data"><thead><tr>
+              <th>Symbol</th><th>Trades</th><th>Win %</th><th>Net</th><th>Best</th><th>Worst</th>
+            </tr></thead><tbody id="anSymbol"></tbody></table></div>
+          </div>
+        </div>
+        <div class="two" style="margin-top:14px">
+          <div class="card">
+            <div class="card-h"><h2>Exit reasons</h2></div>
+            <div class="table-wrap"><table class="data"><thead><tr>
+              <th>Reason</th><th>Trades</th><th>Win %</th><th>Net</th>
+            </tr></thead><tbody id="anReason"></tbody></table></div>
+          </div>
+          <div class="card">
+            <div class="card-h"><h2>PnL distribution</h2></div>
+            <div id="anHist" class="hist"></div>
+          </div>
+        </div>
       </section>
 
       <section class="view" data-view="journal">
         <div class="card">
+          <div class="card-h"><h2>Trade review</h2><span class="sub" id="jrSub">tag, rate and annotate closed trades</span></div>
+          <div class="filter-bar">
+            <select id="jrTag" class="mini"><option value="">all tags</option></select>
+            <button class="mini" id="jrRefresh">Refresh</button>
+          </div>
+          <div class="table-wrap">
+            <table class="data">
+              <thead><tr><th>Closed</th><th>Symbol</th><th>PnL</th><th>R</th><th>Reason</th><th>Tags</th><th>Rating</th><th>Note</th></tr></thead>
+              <tbody id="jrBody"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card" style="margin-top:16px">
           <div class="card-h"><h2>Robot journal</h2></div>
           <div id="journal" class="list"></div>
         </div>
       </section>
     </div>
   </div>
+
+  <!-- command palette -->
+  <div id="cmdk" class="cmdk" style="display:none">
+    <div class="cmdk-box">
+      <input id="cmdkInput" placeholder="Type a command — buy, sell, flatten, cancel, go to…" spellcheck="false" />
+      <div id="cmdkList" class="cmdk-list"></div>
+      <div class="cmdk-foot"><span>↑↓ to move</span><span>↵ to run</span><span>esc to close</span></div>
+    </div>
+  </div>
   <div id="toast"></div>
+  <script src="/static/vendor/lightweight-charts.js"></script>
   <script src="/static/app.js"></script>
+  <script src="/static/pro.js"></script>
+  <script src="/static/mtf.js"></script>
+  <script src="/static/universe.js"></script>
+  <script src="/static/bot.js"></script>
+  <script src="/static/desk.js"></script>
+  <script src="/static/flow.js"></script>
 </body>
 </html>
