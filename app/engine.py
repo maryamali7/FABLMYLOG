@@ -26,6 +26,8 @@ from app.timeframes import MTFEngine
 from app.edge import EdgeEngine
 from app.keys import KeyStore
 from app.live import LiveRouter
+from app.orders import OMS, Order, OrderError
+from app.portfolio import Journal
 from app.tradeset import TradeSet
 from app.universe import Universe
 from app.strategies import build_strategies, ensemble
@@ -142,6 +144,12 @@ class Robot:
         self.live_venue = "binance"
         self.max_live_notional = 50.0
         self.live_errors: list[dict[str, Any]] = []
+        self.oms = OMS(ROOT / "data" / "orders.json")
+        self.journal = Journal(ROOT / "data" / "journal.json")
+        self.trade_log: list[dict[str, Any]] = []   # closed trades with R multiples
+        # desk positions are yours: the signal engine will not close them unless
+        # you hand them over. Protective stops and brackets always still apply.
+        self.manage_manual = False
         set_context_provider(self.symbol_context)
 
     def refresh_strategies(self) -> None:
@@ -269,7 +277,10 @@ class Robot:
             except Exception:
                 pass
 
-        # manage open risk first
+        # working orders first: a resting stop must fire before anything else
+        await self._match_orders()
+
+        # then manage open risk
         for sym in list(self.positions.keys()):
             await self._manage_position(sym)
 
@@ -338,6 +349,9 @@ class Robot:
         if sig.kind == SignalKind.SELL and sig.symbol not in self.positions:
             return
         if sig.kind == SignalKind.SELL and sig.symbol in self.positions:
+            pos = self.positions[sig.symbol]
+            if pos.spec_id == "manual" and not self.manage_manual:
+                return  # hands off a desk position
             await self._close(sig.symbol, t.last, f"signal {sig.reason}")
             return
         allowed, why = self.tradeset.allows(sig.symbol, self.watchlist)
@@ -505,6 +519,150 @@ class Robot:
             log.error("live sell failed for %s: %s", pos.symbol, exc)
             await self.emit("live_error", {"symbol": pos.symbol, "side": "sell", "error": str(exc)[:200]})
 
+    async def _match_orders(self) -> None:
+        """Walk the working-order book against the live tape."""
+        if not self.oms.orders:
+            return
+        symbols = {o.symbol for o in self.oms.orders.values() if o.open}
+        for sym in symbols:
+            t = self.hub.quote(sym)
+            if not t or not t.last:
+                continue
+            pos = self.positions.get(sym)
+            try:
+                intents = self.oms.match(
+                    sym, t.last, t.bid, t.ask, position_qty=pos.qty if pos else 0.0
+                )
+            except Exception as exc:
+                log.warning("order match failed for %s: %s", sym, exc)
+                continue
+            for intent in intents:
+                await self._execute_order(intent["order"], intent["qty"], intent["price"], t)
+
+    async def _execute_order(self, order: Order, qty: float, price: float, t: Ticker) -> None:
+        """Settle one order fill against cash and positions."""
+        fee_rate = self.settings.risk.fee_bps / 10_000
+        if order.side == "buy":
+            notional = qty * price
+            fee = notional * fee_rate
+            if self.cash < notional + fee:
+                self.oms.cancel(order.id, "insufficient cash")
+                return
+            self.cash -= notional + fee
+            pos = self.positions.get(order.symbol)
+            if pos:  # average up into the existing position
+                total = pos.qty + qty
+                pos.entry = (pos.entry * pos.qty + price * qty) / total if total else price
+                pos.qty = total
+            else:
+                atr_val = self._atr_value(order.symbol)
+                self.positions[order.symbol] = Position(
+                    symbol=order.symbol,
+                    side=Side.BUY,
+                    qty=qty,
+                    entry=price,
+                    stop=price * (1 - self.settings.risk.stop_loss_pct),
+                    take=price * (1 + self.settings.risk.take_profit_pct),
+                    trail=price,
+                    opened_ts=time.time(),
+                    strategy=order.label or f"{order.type} order",
+                    exchange=t.exchange,
+                    peak=price,
+                    atr=atr_val,
+                    risk=max(price * self.settings.risk.stop_loss_pct, price * 0.0005),
+                    spec_id="manual" if order.source == "manual" else "",
+                )
+            fill = Fill(
+                id=uuid.uuid4().hex[:12], symbol=order.symbol, side=Side.BUY, qty=qty, price=price,
+                fee=fee, ts=time.time(), strategy=order.label or order.type,
+                exchange=t.exchange, paper=self.mode != "live", reason=f"{order.type} order filled",
+            )
+            await self.store.add_fill(fill)
+            await self.emit("fill", {**fill.to_dict(), "order_id": order.id})
+        else:
+            pos = self.positions.get(order.symbol)
+            if not pos or pos.qty <= 0:
+                self.oms.cancel(order.id, "no position to sell")
+                return
+            qty = min(qty, pos.qty)
+            # settle the order first: closing the position sweeps the rest of
+            # the book for this symbol, and this order must not sweep itself
+            self.oms.confirm(order, qty, price)
+            if qty >= pos.qty - 1e-12:
+                await self._close(order.symbol, price, order.label or f"{order.type} order")
+            else:
+                await self._scale_out(order.symbol, qty / pos.qty, order.label or f"{order.type} order")
+            await self.emit("order", {"event": "fill", **order.to_dict()})
+            return
+        self.oms.confirm(order, qty, price)
+        await self.emit("order", {"event": "fill", **order.to_dict()})
+
+    async def place_order(self, spec: dict[str, Any]) -> dict[str, Any]:
+        """Validate and rest an order from the trade desk."""
+        symbol = str(spec.get("symbol") or "").upper().replace("-", "/")
+        t = self.hub.quote(symbol)
+        if not t:
+            return {"ok": False, "error": f"no live market data for {symbol}"}
+        equity = self.mark_equity
+        qty = float(spec.get("qty") or 0.0)
+        quote_qty = float(spec.get("quote_qty") or 0.0)
+        # risk-based sizing: "lose no more than X% of equity if the stop hits"
+        risk_pct = float(spec.get("risk_pct") or 0.0)
+        stop_price = float(spec.get("stop_loss") or spec.get("stop_price") or 0.0)
+        ref_price = float(spec.get("price") or 0.0) or t.last
+        if risk_pct > 0 and stop_price > 0 and ref_price > stop_price:
+            qty = (equity * risk_pct / 100.0) / (ref_price - stop_price)
+        elif float(spec.get("equity_pct") or 0) > 0:
+            quote_qty = equity * float(spec["equity_pct"]) / 100.0
+        try:
+            order = self.oms.place(
+                Order(
+                    symbol=symbol,
+                    side=str(spec.get("side") or "buy"),
+                    type=str(spec.get("type") or "market"),
+                    qty=qty,
+                    quote_qty=quote_qty,
+                    price=float(spec.get("price") or 0.0),
+                    stop_price=float(spec.get("stop_price") or 0.0),
+                    trail_pct=float(spec.get("trail_pct") or 0.0),
+                    tif=str(spec.get("tif") or "gtc"),
+                    reduce_only=bool(spec.get("reduce_only")),
+                    post_only=bool(spec.get("post_only")),
+                    label=str(spec.get("label") or "manual"),
+                    source="manual",
+                ),
+                last=t.last, bid=t.bid, ask=t.ask,
+            )
+        except OrderError as exc:
+            return {"ok": False, "error": str(exc)}
+
+        brackets = []
+        take = float(spec.get("take_profit") or 0.0)
+        trail = float(spec.get("bracket_trail_pct") or 0.0)
+        if order.side == "buy" and (stop_price > 0 or take > 0 or trail > 0):
+            brackets = [
+                o.to_dict()
+                for o in self.oms.attach_bracket(
+                    symbol, order.qty, stop_price=stop_price, take_price=take,
+                    parent_id=order.id, trail_pct=trail, label=order.label or "bracket",
+                )
+            ]
+        await self._match_orders()
+        # if the order filled and you gave it protection, the position carries it
+        pos = self.positions.get(symbol)
+        if pos and order.side == "buy":
+            if stop_price > 0:
+                pos.stop = stop_price
+                pos.risk = max(pos.entry - stop_price, pos.entry * 0.0005)
+            if take > 0:
+                pos.take = take
+            if trail > 0:
+                pos.trail_pct = trail
+        await self.emit("order", {"event": "placed", **order.to_dict()})
+        return {"ok": True, "order": order.to_dict(), "brackets": brackets,
+                "working": self.oms.working(), "equity": equity,
+                "position": pos.to_dict() if pos else None}
+
     def _fill_price(self, t: Ticker, side: Side) -> float:
         slip = self.settings.risk.slippage_bps / 10_000
         if side == Side.BUY:
@@ -575,6 +733,7 @@ class Robot:
             self.risk.last_loss_ts = time.time()
         r_mult = ((px - pos.entry) / pos.risk) if pos.risk else 0.0
         self.edge.record_trade(pos.strategy, symbol, pnl, round(r_mult, 3))
+        self.oms.cancel_all(symbol)  # a closed position never leaves brackets behind
         fill = Fill(
             id=uuid.uuid4().hex[:12],
             symbol=symbol,
@@ -589,6 +748,14 @@ class Robot:
             pnl=pnl,
             reason=reason,
         )
+        self.trade_log.insert(0, {
+            "id": fill.id, "symbol": symbol, "strategy": pos.strategy, "qty": pos.qty,
+            "entry": pos.entry, "exit": px, "pnl": round(pnl, 4), "r": round(r_mult, 3),
+            "reason": reason, "opened": pos.opened_ts, "closed": time.time(),
+            "quality": pos.quality, "held_sec": round(time.time() - pos.opened_ts, 1),
+            "journal": self.journal.get(fill.id),
+        })
+        self.trade_log = self.trade_log[:400]
         await self.store.add_fill(fill)
         await self.emit("fill", {**fill.to_dict(), "pnl": pnl})
 
@@ -1069,6 +1236,13 @@ class Robot:
             },
             "forecasts_cached": len(self.forecasts),
             "forecast_score": self._forecast_score(),
+            "orders": {
+                "working": len([o for o in self.oms.orders.values() if o.open]),
+                "by_symbol": {
+                    sym: sum(1 for o in self.oms.orders.values() if o.open and o.symbol == sym)
+                    for sym in {o.symbol for o in self.oms.orders.values() if o.open}
+                },
+            },
             "trading": {
                 "mode": self.tradeset.mode,
                 "active": self.tradeset.active(self.watchlist),

@@ -24,6 +24,7 @@ from app.market.venues import MARKETS, VENUES
 from app.universe import PRESETS as UNIVERSE_PRESETS, SORTS as UNIVERSE_SORTS
 from app.keys import TRADABLE as TRADABLE_VENUES
 from app.models import Signal, SignalKind
+from app.portfolio import summary as portfolio_summary
 from app.runtime import Supervisor
 from app.predict import HORIZONS
 from app.rules import COMPARATORS, field_catalog
@@ -395,6 +396,213 @@ async def api_uptime_set(body: RuntimeBody):
 async def api_uptime_check():
     """Run one supervision pass right now."""
     return {"ok": True, "did": await supervisor.tick(), "status": supervisor.status()}
+
+
+# --------------------------------------------------------------------------- #
+# trade desk: orders, brackets, portfolio risk, journal
+# --------------------------------------------------------------------------- #
+
+
+class OrderBody(BaseModel):
+    symbol: str
+    side: str = "buy"
+    type: str = "market"
+    qty: float | None = None
+    quote_qty: float | None = None
+    equity_pct: float | None = None
+    risk_pct: float | None = None
+    price: float | None = None
+    stop_price: float | None = None
+    trail_pct: float | None = None
+    tif: str = "gtc"
+    reduce_only: bool = False
+    post_only: bool = False
+    label: str = "manual"
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    bracket_trail_pct: float | None = None
+
+
+class ModifyBody(BaseModel):
+    price: float | None = None
+    stop_price: float | None = None
+    qty: float | None = None
+    trail_pct: float | None = None
+    label: str | None = None
+
+
+class BracketBody(BaseModel):
+    symbol: str
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    trail_pct: float | None = None
+
+
+class JournalBody(BaseModel):
+    fill_id: str
+    note: str | None = None
+    tags: list[str] | None = None
+    rating: int | None = None
+
+
+@app.get("/api/orders")
+async def api_orders(symbol: str = ""):
+    snap = robot.oms.snapshot()
+    if symbol:
+        sym = symbol.upper().replace("-", "/")
+        snap["working"] = [o for o in snap["working"] if o["symbol"] == sym]
+    return snap
+
+
+@app.post("/api/orders")
+async def api_place_order(body: OrderBody):
+    return await robot.place_order(body.model_dump())
+
+
+@app.post("/api/orders/{order_id}/cancel")
+async def api_cancel_order(order_id: str):
+    order = robot.oms.cancel(order_id, "cancelled from the desk")
+    return {"ok": bool(order), "order": order.to_dict() if order else None, "working": robot.oms.working()}
+
+
+@app.post("/api/orders/{order_id}/modify")
+async def api_modify_order(order_id: str, body: ModifyBody):
+    try:
+        order = robot.oms.modify(order_id, **body.model_dump())
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "order": order.to_dict(), "working": robot.oms.working()}
+
+
+@app.post("/api/orders/cancel_all")
+async def api_cancel_all(symbol: str = "", side: str = ""):
+    return {"ok": True, "cancelled": robot.oms.cancel_all(symbol, side), "working": robot.oms.working()}
+
+
+@app.post("/api/orders/bracket")
+async def api_attach_bracket(body: BracketBody):
+    """Attach protective orders to a position that does not have them."""
+    sym = body.symbol.upper().replace("-", "/")
+    pos = robot.positions.get(sym)
+    if not pos:
+        return {"ok": False, "error": f"no open position in {sym}"}
+    orders = robot.oms.attach_bracket(
+        sym, pos.qty,
+        stop_price=float(body.stop_loss or 0),
+        take_price=float(body.take_profit or 0),
+        trail_pct=float(body.trail_pct or 0),
+        label="manual bracket",
+    )
+    if not orders:
+        return {"ok": False, "error": "give a stop, a target or a trail"}
+    return {"ok": True, "orders": [o.to_dict() for o in orders], "working": robot.oms.working()}
+
+
+class DeskSettingsBody(BaseModel):
+    manage_manual: bool | None = None
+
+
+@app.post("/api/desk/settings")
+async def api_desk_settings(body: DeskSettingsBody):
+    """Hand desk positions to the robot, or take them back."""
+    if body.manage_manual is not None:
+        robot.manage_manual = bool(body.manage_manual)
+    return {"ok": True, "manage_manual": robot.manage_manual}
+
+
+@app.get("/api/desk")
+async def api_desk(symbol: str = ""):
+    """Everything the trade ticket needs in one round trip."""
+    sym = (symbol or (robot.watchlist[0] if robot.watchlist else "BTC/USDT")).upper().replace("-", "/")
+    t = hub.quote(sym)
+    book = hub.books.get(sym)
+    pos = robot.positions.get(sym)
+    equity = robot.mark_equity
+    return {
+        "symbol": sym,
+        "quote": {
+            "last": t.last if t else None,
+            "bid": t.bid if t else None,
+            "ask": t.ask if t else None,
+            "spread_bps": round(t.spread_bps, 2) if t else None,
+            "change_pct": t.change_pct if t else None,
+            "exchange": t.exchange if t else None,
+        },
+        "book": {
+            "bids": [[l.price, l.qty] for l in (book.bids[:12] if book else [])],
+            "asks": [[l.price, l.qty] for l in (book.asks[:12] if book else [])],
+        },
+        "position": pos.to_dict() if pos else None,
+        "working": robot.oms.working(sym),
+        "equity": round(equity, 2),
+        "cash": round(robot.cash, 2),
+        "buying_power": round(robot.cash, 2),
+        "risk_cfg": {
+            "max_position_pct": settings.risk.max_position_pct,
+            "vol_target_pct": robot.edge.cfg.get("vol_target_pct"),
+            "fee_bps": settings.risk.fee_bps,
+        },
+        "watchlist": robot.watchlist,
+        "manage_manual": robot.manage_manual,
+        "trades": [
+            {
+                "ts": tr["closed"], "symbol": tr["symbol"], "pnl": tr["pnl"], "r": tr["r"],
+                "reason": tr["reason"],
+            }
+            for tr in robot.trade_log[:15]
+        ],
+    }
+
+
+@app.get("/api/portfolio")
+async def api_portfolio():
+    """Exposure, concentration, correlation, open risk, VaR and R distribution."""
+    positions = []
+    for sym, p in robot.positions.items():
+        t = hub.quote(sym)
+        row = p.to_dict()
+        row["price"] = t.last if t else p.entry
+        positions.append(row)
+    series = {}
+    for sym in robot.watchlist[:14]:
+        win = hub.candles.get(sym)
+        if win and len(win) > 30:
+            series[sym] = list(win.tail(300).closes)
+    curve = await store.equity_series(400)
+    return portfolio_summary(
+        positions=positions,
+        equity=robot.mark_equity,
+        cash=robot.cash,
+        equity_curve=curve,
+        series=series,
+        fills=robot.trade_log,
+        journal=robot.journal,
+    )
+
+
+@app.get("/api/journal")
+async def api_journal(limit: int = Query(60, ge=1, le=400), tag: str = ""):
+    rows = []
+    for tr in robot.trade_log[:limit]:
+        entry = robot.journal.get(tr["id"])
+        if tag and tag.lower() not in (entry.get("tags") or []):
+            continue
+        rows.append({**tr, "journal": entry})
+    return {
+        "rows": rows,
+        "tags": robot.journal.tags(),
+        "by_tag": robot.journal.by_tag(robot.trade_log),
+        "total": len(robot.trade_log),
+    }
+
+
+@app.post("/api/journal")
+async def api_journal_write(body: JournalBody):
+    entry = robot.journal.annotate(body.fill_id, note=body.note, tags=body.tags, rating=body.rating)
+    for tr in robot.trade_log:
+        if tr["id"] == body.fill_id:
+            tr["journal"] = entry
+    return {"ok": True, "entry": entry, "tags": robot.journal.tags()}
 
 
 @app.get("/api/state")

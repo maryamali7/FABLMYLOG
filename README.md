@@ -13,6 +13,10 @@ A full trading terminal that:
 - Ships an **advanced screener**: 40+ factors, custom queries, presets, grades and CSV export
 - Runs **multi-timeframe analysis** — RSI, trend, ADX, MACD and a rating on 1m/5m/15m/1h/4h/1d/1w with an alignment verdict
 - **Predicts the next move** with a six-model ensemble: direction, probability, expected move, target, cone, S/R and a plain-English "why"
+- Runs a real **trade desk**: market/limit/stop/stop-limit/trailing orders, IOC/FOK/DAY, reduce-only,
+  post-only, OCO brackets, a click-to-trade depth ladder and four sizing modes
+- Measures **portfolio risk**: exposure, concentration, correlation matrix, open risk, historical VaR
+  and the R distribution of every closed trade
 - Fires **custom alert rules** (with cooldowns, auto-watch and webhooks)
 - Reports **performance analytics** per strategy, symbol, exit reason and hour
 - Serves a dark trading dashboard with candles, order book, print tape, arb scanner, fills, and journal
@@ -62,8 +66,10 @@ Binance REST ─┘
          Strategy ensemble → TradeSet (coin picker) → Edge gate (quality,
               sizing, exits) → RiskGate → Paper or live execution
                     │                              ▲
+   Trade desk ──► OMS (limit/stop/trail, OCO, TIF) ─┤
                     │                   Supervisor (24/7 watchdog)
                     │
+                    ├──► Portfolio risk (exposure, correlation, VaR, R)
                     ▼
               SQLite journal + FastAPI / WebSocket dashboard
 ```
@@ -353,6 +359,91 @@ WantedBy=multi-user.target
 sudo systemctl enable --now fablmylog     # or: docker run --restart=unless-stopped ...
 ```
 
+## Trade desk
+
+A proper order-management system sits between you and the paper engine, so a manual trade behaves
+the way it would on an exchange rather than being an instant market fill.
+
+**Order types** — `market`, `limit`, `stop`, `stop_limit`, `trailing_stop`.
+**Time in force** — `gtc`, `ioc`, `fok`, `day` (expires at the next UTC midnight).
+**Flags** — `reduce_only` (never flips you short, sized down to the position), `post_only` (rejected
+at placement if it would cross the spread).
+
+Matching rules the engine applies on every tick:
+
+| Order | Fills when | At |
+|---|---|---|
+| limit buy | `ask <= price` | `min(price, ask)` |
+| limit sell | `bid >= price` | `max(price, bid)` |
+| stop buy | `last >= stop` | the offer, after triggering |
+| stop sell | `last <= stop` | the bid, after triggering |
+| stop-limit | trigger first, then rests as a limit | limit rules |
+| trailing stop | `peak` ratchets up with price, `stop = peak × (1 − trail)` | the bid |
+
+### Sizing
+
+The ticket takes quantity four ways, and the preview always shows notional, % of equity, fee, the
+cash loss if the stop is hit, and reward:risk before you commit:
+
+| Mode | Field | Meaning |
+|---|---|---|
+| Base | `qty` | coins |
+| Quote | `quote_qty` | dollars of notional |
+| % equity | `equity_pct` | share of mark equity |
+| Risk % | `risk_pct` + a stop | `qty = equity × risk% / (entry − stop)` |
+
+Risk-based sizing is the one worth using: it holds the *loss* constant instead of the *position*, so a
+tight stop buys a big position and a wide stop buys a small one. The ticket refuses to size when the
+stop is on the wrong side of the entry, and warns when the result would break your position cap.
+
+### Brackets and OCO
+
+Tick **attach bracket** and the stop-loss and take-profit are placed with the entry as one OCO group:
+whichever fills first cancels its sibling. Bracket children sleep until their parent entry fills (so
+the reduce-only sweep cannot cancel them before the position exists), and they are cancelled with the
+entry if you pull it. Closing a position sweeps every remaining order on that symbol.
+
+Desk positions carry a `manual` tag: the signal engine **will not close them** on an opposing
+ensemble signal unless you hand them over with the *robot may close desk positions* switch. Stops,
+targets and the edge exit manager always still apply.
+
+### Depth ladder and time & sales
+
+Ten levels each side with size bars; click any price to load it into the ticket (and flip a market
+order to a limit). Below it, the last fifteen closed trades with PnL and R.
+
+### Command palette
+
+`Ctrl`/`⌘`+`K` anywhere: jump between views, buy 1% of equity, close or flatten the current symbol,
+cancel one symbol's orders or the whole book, pause/resume the robot, or jump the desk to any
+watchlist coin.
+
+## Portfolio risk
+
+`GET /api/portfolio` and the **Risk & portfolio** view answer the questions that decide whether a
+book survives:
+
+- **Exposure** — notional and weight per position, gross vs net, cash %, and a Herfindahl
+  concentration score labelled *diversified / concentrated / single-name risk*
+- **Open risk** — what it costs if every stop is hit at once, in dollars and % of equity, plus the
+  open R on each trade and a list of positions with **no stop at all**
+- **Correlation** — pairwise correlation of recent returns across the book, drawn as a heat map
+  (red = moving together = one bet, not several) with the tightest pairs called out
+- **Value at risk** — historical VaR 95/99 from the realised equity curve, expected shortfall
+  (the average of the losses beyond VaR), volatility and the worst observed period
+- **R distribution** — the histogram of closed trades in R multiples, expectancy, average win and
+  loss, and the share of gross profit produced by the best decile of trades
+
+The summary emits plain-English warnings: a name over 25% of equity, a concentrated book, unstopped
+positions, open risk above 6%, or an average correlation over 0.7.
+
+## Trade review
+
+Every closed trade lands in the journal with its PnL, R multiple and exit reason. Tag it
+(`breakout`, `fomo`, `news`), rate it 0-5 and write a note; the **Playbook tags** table on the risk
+view then aggregates trades, win rate, net and average PnL per tag, so you can see which setups
+actually pay and which ones only feel good.
+
 ## Alert rules & analytics
 
 Alert rules reuse the same rule engine against screener rows, with severity, message
@@ -404,6 +495,14 @@ per-exit-reason and hourly edge tables, streaks, a PnL histogram and equity-curv
 | POST | `/api/keys/test` · `/api/keys/trading` | signed read-only test, enable orders |
 | GET | `/api/live` · `POST /api/live/arm` · `/disarm` | live routing state and arming |
 | GET/POST | `/api/uptime` · `POST /api/uptime/check` | 24/7 supervisor |
+| GET | `/api/desk?symbol=` | quote, 12-level book, position, working orders, equity and last trades |
+| POST | `/api/desk/settings` | hand desk positions to the robot, or take them back |
+| GET/POST | `/api/orders` | working-order snapshot / place an order |
+| POST | `/api/orders/{id}/cancel` · `/modify` | pull or amend a resting order |
+| POST | `/api/orders/cancel_all?symbol=&side=` | sweep the book |
+| POST | `/api/orders/bracket` | attach a stop / target / trail to an open position |
+| GET | `/api/portfolio` | exposure, concentration, correlation, open risk, VaR, R distribution |
+| GET/POST | `/api/journal` | closed trades with annotations / tag, rate and note one |
 
 ## Config
 
@@ -443,3 +542,8 @@ The terminal now includes:
 pip install pytest
 pytest -q
 ```
+
+201 tests cover the indicator maths, rule frames, screener, builder specs, forecast scoring, the
+instrument universe, coin selection, the edge engine, credential storage, the supervisor, the order
+matcher (triggers, OCO, post-only, IOC, reduce-only, trailing ratchet, bracket arming) and the
+portfolio risk maths.
