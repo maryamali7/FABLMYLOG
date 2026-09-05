@@ -16,8 +16,9 @@ import numpy as np
 from app.custom import CustomStrategy, normalize_spec
 from app.indicators import RollingWindow
 from app.models import SignalKind
-from app.rules import compute_frame, context_at
+from app.rules import FORECAST_FIELDS, MTF_FIELDS, compute_frame, context_at
 from app.strategies import REGISTRY
+from app.timeframes import MTFHistory, mtf_history
 
 DEFAULTS = {
     "starting_equity": 10_000.0,
@@ -89,6 +90,33 @@ def _grade(m: dict[str, Any]) -> str:
     return ["D", "D", "C", "C", "B", "B", "A", "A+"][min(score, 7)]
 
 
+def _referenced_fields(node: Any, out: set[str] | None = None) -> set[str]:
+    """Every field name a rule tree touches (left sides and field-valued rights)."""
+    out = set() if out is None else out
+    if isinstance(node, dict):
+        for key in ("rules", "conditions", "any", "all", "none"):
+            for child in node.get(key) or []:
+                _referenced_fields(child, out)
+        for side in ("left", "right"):
+            val = node.get(side)
+            if isinstance(val, str):
+                out.add(val.strip())
+        if isinstance(node.get("expr"), str):
+            for token in node["expr"].replace("(", " ").replace(")", " ").split():
+                out.add(token.strip())
+    elif isinstance(node, list):
+        for child in node:
+            _referenced_fields(child, out)
+    return out
+
+
+def spec_fields(spec: dict[str, Any]) -> set[str]:
+    fields: set[str] = set()
+    for key in ("entry", "exit", "short_entry"):
+        _referenced_fields(spec.get(key), fields)
+    return fields
+
+
 def backtest(
     candles: Any,
     spec: dict[str, Any] | None = None,
@@ -130,6 +158,33 @@ def backtest(
         allow_short = bool(cfg["allow_short"])
     else:
         return {"ok": False, "error": "provide a strategy spec or builtin name", "metrics": {}}
+
+    notes: list[str] = []
+    hist: MTFHistory | None = None
+    if spec is not None:
+        used = spec_fields(spec)
+        if used & set(MTF_FIELDS):
+            try:
+                hist = mtf_history(candles)
+            except Exception as exc:  # pragma: no cover - defensive
+                notes.append(f"multi-timeframe context unavailable: {exc}")
+            if hist is not None:
+                if hist.available:
+                    notes.append(
+                        "multi-timeframe context replayed on closed bars only: "
+                        + ", ".join(hist.available)
+                    )
+                else:
+                    notes.append(
+                        "not enough history to rebuild higher timeframes — "
+                        "timeframe rules were skipped"
+                    )
+        missing_fc = sorted(used & set(FORECAST_FIELDS))
+        if missing_fc:
+            notes.append(
+                "forecast fields are live-only and are not simulated in replay: "
+                + ", ".join(missing_fc)
+            )
 
     fee = float(cfg["fee_bps"]) / 10_000.0
     slip = float(cfg["slippage_bps"]) / 10_000.0
@@ -181,7 +236,7 @@ def backtest(
             if exit_px is None and pos["bars"] >= int(cfg["max_bars_held"]):
                 exit_px, reason = px, "time stop"
             if exit_px is None:
-                sig = _signal_at(strat, symbol, frame, i, px, win)
+                sig = _signal_at(strat, symbol, frame, i, px, win, hist, float(ts[i]))
                 if sig is not None:
                     want_exit = (side == "long" and sig.kind == SignalKind.SELL) or (
                         side == "short" and sig.kind == SignalKind.BUY
@@ -214,7 +269,7 @@ def backtest(
 
         # ---- look for a new entry
         if pos is None:
-            sig = _signal_at(strat, symbol, frame, i, px, win)
+            sig = _signal_at(strat, symbol, frame, i, px, win, hist, float(ts[i]))
             if sig is not None and sig.kind in (SignalKind.BUY, SignalKind.SELL):
                 side = "long" if sig.kind == SignalKind.BUY else "short"
                 if side == "short" and not allow_short:
@@ -261,13 +316,27 @@ def backtest(
         else 0.0,
         "elapsed_ms": round((time.time() - t0) * 1000, 1),
         "config": cfg,
+        "notes": notes,
+        "timeframes": list(hist.available) if hist is not None else [],
     }
 
 
-def _signal_at(strat: Any, symbol: str, frame: dict[str, np.ndarray], i: int, px: float, win: RollingWindow | None):
+def _signal_at(
+    strat: Any,
+    symbol: str,
+    frame: dict[str, np.ndarray],
+    i: int,
+    px: float,
+    win: RollingWindow | None,
+    hist: MTFHistory | None = None,
+    ts: float | None = None,
+):
     try:
         if isinstance(strat, CustomStrategy):
-            ctx = context_at(frame, i, extra={"live_price": px})
+            extra: dict[str, Any] = {"live_price": px}
+            if hist is not None and ts is not None:
+                extra.update(hist.fields_at(ts))
+            ctx = context_at(frame, i, extra=extra)
             return strat.evaluate_ctx(symbol, ctx, px)
         if win is not None:
             return strat.evaluate(symbol, win, px)

@@ -173,6 +173,28 @@ Multi-timeframe and forecast values are first-class **rule-engine fields**, so b
 strategies, screener queries and alert rules can all say things like
 `trend_1h == up AND rsi_15m < 40 AND prob_up > 58`.
 
+### Prediction scoreboard
+
+Every forecast is logged with its horizon and **graded against the real price** once that
+horizon elapses (`GET /api/forecasts/accuracy`):
+
+* **hit rate** and edge vs a coin flip, **Brier score**, **band coverage** (did price finish
+  inside the predicted range) and mean absolute error of the expected move,
+* accuracy **per model** — so you can see whether the analog or the trend model is actually
+  carrying the ensemble — and **per timeframe**,
+* a **calibration curve**: when the ensemble says 70%, does it happen 70% of the time?
+
+On boot the scoreboard is seeded from candle history: the ensemble is re-run on truncated
+windows (it only ever sees bars that existed at that moment) and graded against the price
+that actually printed one horizon later. `POST /api/forecasts/backfill` re-runs it.
+
+### Timeframe rules in backtests
+
+The backtester rebuilds the higher timeframes from the same candles and replays them
+**bar by bar on closed bars only**, so a strategy using `trend_1h` or `rsi_15m` is tested
+without look-ahead. Results list which frames were replayed, and warn when a rule uses a
+live-only forecast field that cannot be simulated.
+
 ## Alert rules & analytics
 
 Alert rules reuse the same rule engine against screener rows, with severity, message
@@ -200,6 +222,8 @@ per-exit-reason and hourly edge tables, streaks, a PnL histogram and equity-curv
 | GET | `/api/mtf` · `/api/mtf/{sym}` · `POST /api/mtf/refresh` | multi-timeframe alignment |
 | GET | `/api/predict/{sym}?tf=&horizon=` | next-move forecast |
 | GET | `/api/forecasts` · `/api/levels/{sym}` | ranked forecasts, support/resistance |
+| GET | `/api/forecasts/accuracy` | hit rate, Brier, calibration, per-model scoring |
+| POST | `/api/forecasts/backfill` | re-seed the scoreboard from candle history |
 
 ## Config
 

@@ -624,6 +624,20 @@ async def api_forecasts(limit: int = Query(12, ge=1, le=60)):
     }
 
 
+@app.get("/api/forecasts/accuracy")
+async def api_forecast_accuracy(limit: int = Query(400, ge=20, le=1000)):
+    """Scoreboard: how well the prediction ensemble has actually done."""
+    return robot.tracker.stats(limit=limit)
+
+
+@app.post("/api/forecasts/backfill")
+async def api_forecast_backfill(symbol: str | None = None, points: int = Query(8, ge=1, le=40)):
+    """Re-seed the scoreboard from candle history (no look-ahead)."""
+    targets = [symbol.upper().replace("-", "/")] if symbol else None
+    graded = await robot.backfill_scoreboard(targets, points=points)
+    return {"ok": True, "graded": graded, "stats": robot.tracker.stats(limit=200)}
+
+
 @app.get("/api/levels/{symbol:path}")
 async def api_levels(symbol: str, tf: str = Query("1m")):
     sym = symbol.upper().replace("-", "/")

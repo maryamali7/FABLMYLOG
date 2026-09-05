@@ -273,6 +273,42 @@
             </div>
           </div>
         </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-h">
+            <div>
+              <h2>Prediction scoreboard</h2>
+              <p class="sub" id="scoreMeta">Every forecast is graded against the real price once its horizon elapses</p>
+            </div>
+          </div>
+          <div class="metric-grid" id="scoreKpis"></div>
+          <div class="score-grid">
+            <div>
+              <h3 class="mini-h">Model accuracy</h3>
+              <div class="table-wrap">
+                <table class="data">
+                  <thead><tr><th>Model</th><th>Calls</th><th>Hit rate</th><th>Edge</th></tr></thead>
+                  <tbody id="scoreModels"></tbody>
+                </table>
+              </div>
+            </div>
+            <div>
+              <h3 class="mini-h">Calibration</h3>
+              <div id="scoreCal" class="cal-list"></div>
+            </div>
+            <div>
+              <h3 class="mini-h">Awaiting settlement</h3>
+              <div id="scorePending" class="list small-list"></div>
+            </div>
+          </div>
+          <h3 class="mini-h">Last graded calls</h3>
+          <div class="table-wrap">
+            <table class="data">
+              <thead><tr><th>Symbol</th><th>TF</th><th>Call</th><th>Prob</th><th>Expected</th><th>Actual</th><th>Result</th></tr></thead>
+              <tbody id="scoreRecent"></tbody>
+            </table>
+          </div>
+        </div>
       </section>
 
       <!-- ================= STRATEGY BUILDER ================= -->

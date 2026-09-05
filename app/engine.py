@@ -8,14 +8,16 @@ from typing import Any
 
 from app.alerts import AlertEngine
 from app.analytics import analyze
-from app.config import Settings, has_live_keys
+from app.config import ROOT, Settings, has_live_keys
 from app.custom import CustomRegistry, set_context_provider
+from app.forecast_track import ForecastTracker
 from app.indicators import atr, ema, roc
 from app.market.hub import MarketHub
 from app.market.rest import fetch_klines, fetch_universe, ping_exchanges
 from app.models import Fill, Position, Side, Signal, SignalKind, Ticker
 from app.screener import build_boards
 from app.screener import scan as scan_screener
+from app.predict import HORIZONS
 from app.predict import predict as forecast_symbol
 from app.predict import rank_forecasts
 from app.rules import FRAMES
@@ -124,6 +126,7 @@ class Robot:
         self.forecast_board: dict[str, list[dict[str, Any]]] = {"up": [], "down": [], "all": []}
         self._forecast_cursor = 0
         self.loop_ms = 0.0
+        self.tracker = ForecastTracker(ROOT / "data" / "forecast_log.json")
         set_context_provider(self.symbol_context)
 
     def refresh_strategies(self) -> None:
@@ -197,6 +200,8 @@ class Robot:
                 await self.mtf.refresh_symbol(sym)
             except Exception as exc:
                 log.debug("mtf prime %s: %s", sym, exc)
+        if not self.tracker.settled:
+            asyncio.create_task(self.backfill_scoreboard())
         self.risk.day_start_equity = self.mark_equity
         self.risk.peak_equity = self.mark_equity
 
@@ -502,6 +507,15 @@ class Robot:
         ctx.update(self.forecast_fields(symbol))
         return ctx
 
+    def _last_price(self, symbol: str) -> float | None:
+        t = self.hub.quote(symbol)
+        if t and t.last:
+            return float(t.last)
+        win = self.hub.candles.get(symbol)
+        if win and len(win):
+            return float(win.closes[-1])
+        return None
+
     def forecast_fields(self, symbol: str) -> dict[str, Any]:
         f = self.forecasts.get(symbol)
         if not f or not f.get("ok"):
@@ -519,6 +533,64 @@ class Robot:
             "regime": (f.get("regime") or {}).get("name", "unknown"),
             "support_dist": abs(sup.get("distance_pct", 0.0)),
             "resistance_dist": abs(res.get("distance_pct", 0.0)),
+        }
+
+    async def backfill_scoreboard(self, symbols: list[str] | None = None, points: int = 8) -> int:
+        """Seed the forecast scoreboard from candle history.
+
+        Each sample runs the ensemble on a truncated window (so it only ever
+        sees bars that existed at that moment) and grades it against the price
+        the market actually printed one horizon later.
+        """
+        targets = symbols or self.watchlist[:6]
+        graded = 0
+        for sym in targets:
+            win = self.hub.candles.get(sym)
+            if not win or len(win) < 400:
+                continue
+            rows = [
+                {
+                    "ts": win.ts[i],
+                    "open": win.opens[i],
+                    "high": win.highs[i],
+                    "low": win.lows[i],
+                    "close": win.closes[i],
+                    "volume": win.volumes[i],
+                }
+                for i in range(len(win))
+            ]
+            horizon = HORIZONS.get("1m", 15)
+            spacing = max(horizon, (len(rows) - 260) // max(1, points))
+            cut = len(rows) - horizon - 1
+            for _ in range(points):
+                if cut < 260:
+                    break
+                history = rows[:cut]
+                try:
+                    out = forecast_symbol(history, symbol=sym, timeframe="1m")
+                except Exception:
+                    break
+                if out.get("ok"):
+                    exit_px = rows[cut - 1 + horizon]["close"]
+                    if self.tracker.grade_historic(out, exit_px, ts=rows[cut - 1]["ts"]):
+                        graded += 1
+                cut -= spacing
+                await asyncio.sleep(0)
+        if graded:
+            self.tracker.save()
+            log.info("forecast scoreboard seeded with %d graded historical calls", graded)
+        return graded
+
+    def _forecast_score(self) -> dict[str, Any]:
+        """Small scoreboard summary for the live snapshot."""
+        st = self.tracker
+        graded = [r for r in st.settled[:200] if r.get("hit") is not None]
+        return {
+            "open": len(st.open),
+            "settled": len(st.settled),
+            "hit_rate": round(sum(1 for r in graded if r["hit"]) / len(graded) * 100, 1)
+            if graded
+            else None,
         }
 
     def _refresh_forecasts(self, batch: int = 4) -> None:
@@ -545,7 +617,16 @@ class Robot:
                 continue
             if out.get("ok"):
                 self.forecasts[sym] = out
+                self.tracker.record(out)
         self.forecast_board = rank_forecasts(list(self.forecasts.values()))
+        try:
+            settled = self.tracker.settle(self._last_price)
+        except Exception as exc:
+            log.debug("forecast settle: %s", exc)
+            settled = []
+        if settled:
+            hits = sum(1 for r in settled if r.get("hit"))
+            log.debug("settled %d forecasts (%d hits)", len(settled), hits)
 
     def forecast(self, symbol: str, timeframe: str = "1m", horizon: int | None = None) -> dict[str, Any]:
         """On-demand forecast for any symbol / timeframe."""
@@ -817,6 +898,7 @@ class Robot:
                 "down": (self.forecast_board.get("down") or [])[:6],
             },
             "forecasts_cached": len(self.forecasts),
+            "forecast_score": self._forecast_score(),
             "loop_ms": self.loop_ms,
             "frame_cache": {"hits": FRAMES.hits, "misses": FRAMES.misses},
             "risk": self.settings.risk.model_dump(),

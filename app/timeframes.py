@@ -118,20 +118,43 @@ def resample(candles: Any, seconds: int) -> list[dict[str, float]]:
     return out
 
 
+def _unavailable(tf: str, bars: int, source: str) -> dict[str, Any]:
+    return {
+        "tf": tf,
+        "label": TF_LABEL.get(tf, tf),
+        "available": False,
+        "bars": bars,
+        "source": source,
+        "reason": "not enough history yet",
+    }
+
+
 def tf_metrics(tf: str, candles: list[dict[str, float]], source: str = "rest") -> dict[str, Any]:
     """Indicator read-out + technical rating for a single timeframe."""
     n = len(candles or [])
     if n < MIN_TF_BARS:
-        return {
-            "tf": tf,
-            "label": TF_LABEL.get(tf, tf),
-            "available": False,
-            "bars": n,
-            "source": source,
-            "reason": "not enough history yet",
-        }
+        return _unavailable(tf, n, source)
     frame = compute_frame(candles, max_bars=320)
-    ctx = context_at(frame)
+    return frame_metrics(tf, frame, -1, source=source, bars=n)
+
+
+def frame_metrics(
+    tf: str,
+    frame: dict[str, Any],
+    idx: int = -1,
+    source: str = "rest",
+    bars: int | None = None,
+) -> dict[str, Any]:
+    """Score one bar of an already-computed frame (used live and in replay)."""
+    total = len(frame.get("close", []))
+    if not total:
+        return _unavailable(tf, 0, source)
+    real_idx = idx if idx >= 0 else total + idx
+    real_idx = max(0, min(total - 1, real_idx))
+    n = bars if bars is not None else real_idx + 1
+    if n < MIN_TF_BARS:
+        return _unavailable(tf, n, source)
+    ctx = context_at(frame, real_idx)
     g = lambda k, d=0.0: float(ctx.get(k, d))  # noqa: E731
     close = g("close")
     rsi = g("rsi", 50.0)
@@ -155,9 +178,14 @@ def tf_metrics(tf: str, candles: list[dict[str, float]], source: str = "rest") -
     score = float(max(-100.0, min(100.0, score)))
 
     closes = frame["close"]
-    change = float((closes[-1] / closes[-2] - 1) * 100) if len(closes) > 1 and closes[-2] else 0.0
-    span = min(len(closes) - 1, 14)
-    change_span = float((closes[-1] / closes[-1 - span] - 1) * 100) if span > 0 and closes[-1 - span] else 0.0
+    prev_i = max(0, real_idx - 1)
+    change = float((closes[real_idx] / closes[prev_i] - 1) * 100) if closes[prev_i] else 0.0
+    span = min(real_idx, 14)
+    change_span = (
+        float((closes[real_idx] / closes[real_idx - span] - 1) * 100)
+        if span > 0 and closes[real_idx - span]
+        else 0.0
+    )
 
     return {
         "tf": tf,
@@ -188,8 +216,29 @@ def tf_metrics(tf: str, candles: list[dict[str, float]], source: str = "rest") -
         "score": round(score, 1),
         "rating": rating_label(score),
         "squeeze": bool(g("squeeze")),
-        "last_ts": float(frame["ts"][-1]) if len(frame.get("ts", [])) else 0.0,
+        "last_ts": float(frame["ts"][real_idx]) if len(frame.get("ts", [])) else 0.0,
     }
+
+
+def flatten(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Screener/rule-engine friendly flattened fields (rsi_1h, trend_4h, …)."""
+    usable = [r for r in rows if r and r.get("available")]
+    out: dict[str, Any] = {}
+    for r in usable:
+        tf = r["tf"]
+        out[f"rsi_{tf}"] = r["rsi"]
+        out[f"score_{tf}"] = r["score"]
+        out[f"trend_{tf}"] = r["trend"]
+        out[f"adx_{tf}"] = r["adx"]
+    summary = align(usable)
+    out["mtf_score"] = summary["score"]
+    out["mtf_agreement"] = summary["agreement"]
+    out["mtf_bias"] = summary["bias"]
+    out["mtf_verdict"] = summary["verdict"]
+    out["mtf_timeframes"] = summary["timeframes"]
+    out["mtf_overbought"] = sum(1 for r in usable if r.get("rsi_state") == "overbought")
+    out["mtf_oversold"] = sum(1 for r in usable if r.get("rsi_state") == "oversold")
+    return out
 
 
 def align(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
@@ -338,23 +387,7 @@ class MTFEngine:
 
     def flat_fields(self, symbol: str) -> dict[str, Any]:
         """Screener/rule-engine friendly flattened fields (rsi_1h, trend_4h, …)."""
-        out: dict[str, Any] = {}
-        rows = [r for r in self.rows(symbol) if r.get("available")]
-        for r in rows:
-            tf = r["tf"]
-            out[f"rsi_{tf}"] = r["rsi"]
-            out[f"score_{tf}"] = r["score"]
-            out[f"trend_{tf}"] = r["trend"]
-            out[f"adx_{tf}"] = r["adx"]
-        summary = align(rows)
-        out["mtf_score"] = summary["score"]
-        out["mtf_agreement"] = summary["agreement"]
-        out["mtf_bias"] = summary["bias"]
-        out["mtf_verdict"] = summary["verdict"]
-        out["mtf_timeframes"] = summary["timeframes"]
-        out["mtf_overbought"] = sum(1 for r in rows if r.get("rsi_state") == "overbought")
-        out["mtf_oversold"] = sum(1 for r in rows if r.get("rsi_state") == "oversold")
-        return out
+        return flatten(self.rows(symbol))
 
     def best_frame(self, symbol: str, tf: str = "1m") -> list[dict[str, float]]:
         entry = self.candles.get((symbol, tf))
@@ -387,3 +420,86 @@ class MTFEngine:
             out.append(row)
         out.sort(key=lambda r: abs(r["mtf_score"]), reverse=True)
         return out
+
+
+# --------------------------------------------------------------------------- #
+# historical replay (backtesting)
+# --------------------------------------------------------------------------- #
+
+
+class MTFHistory:
+    """Point-in-time multi-timeframe context for bar replay.
+
+    Higher-timeframe bars only become visible once they have *closed*, so a
+    backtest can never peek at a 1h candle that is still forming.
+    """
+
+    def __init__(self, frames: dict[str, dict[str, Any]], timeframes: list[str]):
+        self.frames = frames
+        self.timeframes = timeframes
+        self._cache: dict[tuple, dict[str, Any]] = {}
+
+    @property
+    def available(self) -> list[str]:
+        return [tf for tf, f in self.frames.items() if f["rows"]]
+
+    def rows_at(self, ts: float) -> list[dict[str, Any]]:
+        out = []
+        for tf in self.timeframes:
+            data = self.frames.get(tf)
+            if not data or not len(data["close_ts"]):
+                continue
+            idx = int(np.searchsorted(data["close_ts"], ts, side="right")) - 1
+            if idx < 0:
+                continue
+            row = data["rows"][idx]
+            if row and row.get("available"):
+                out.append(row)
+        return out
+
+    def fields_at(self, ts: float) -> dict[str, Any]:
+        """Flattened rule-engine fields visible at ``ts`` (cached per bucket)."""
+        key = tuple(
+            int(np.searchsorted(self.frames[tf]["close_ts"], ts, side="right")) - 1
+            for tf in self.timeframes
+            if self.frames.get(tf) is not None
+        )
+        hit = self._cache.get(key)
+        if hit is None:
+            hit = flatten(self.rows_at(ts))
+            self._cache[key] = hit
+        return hit
+
+
+def mtf_history(
+    candles: Any,
+    timeframes: list[str] | None = None,
+    base_seconds: int = 60,
+    max_bars: int = 4000,
+) -> MTFHistory:
+    """Pre-compute every higher-timeframe bar so a replay can look them up."""
+    wanted = [tf for tf in (timeframes or TF_ORDER) if TF_SECONDS.get(tf, 0) > base_seconds]
+    frames: dict[str, dict[str, Any]] = {}
+    for tf in wanted:
+        seconds = TF_SECONDS[tf]
+        rows = resample(candles, seconds)
+        if len(rows) < MIN_TF_BARS:
+            continue
+        rows = rows[-max_bars:]
+        frame = compute_frame(rows, max_bars=len(rows))
+        if not frame or not len(frame.get("close", [])):
+            continue
+        n = len(frame["close"])
+        metrics: list[dict[str, Any] | None] = []
+        for i in range(n):
+            metrics.append(
+                frame_metrics(tf, frame, i, source="resample", bars=i + 1)
+                if i + 1 >= MIN_TF_BARS
+                else None
+            )
+        frames[tf] = {
+            "rows": metrics,
+            # a bar is only usable once its bucket has fully closed
+            "close_ts": np.asarray([float(t) + seconds for t in frame["ts"]], dtype=float),
+        }
+    return MTFHistory(frames, [tf for tf in wanted if tf in frames])

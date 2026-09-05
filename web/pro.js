@@ -629,7 +629,12 @@ async function runBacktest(basket = false) {
     ["Avg hold", m.avg_bars_held + " bars"],
     ["Final", "$" + m.final_equity],
   ]);
-  P("btTrades").innerHTML = (res.trades || [])
+  const btNotes = res.notes || [];
+  P("btTrades").innerHTML =
+    (btNotes.length
+      ? `<div class="fb">${btNotes.map((n) => `<div class="muted">• ${n}</div>`).join("")}</div>`
+      : "") +
+  (res.trades || [])
     .slice(-25)
     .reverse()
     .map(

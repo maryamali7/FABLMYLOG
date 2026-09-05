@@ -341,6 +341,95 @@
     });
   }
 
+  // ------------------------------------------------------------ scoreboard
+  function renderScore(st) {
+    const kpis = $("scoreKpis");
+    if (!kpis) return;
+    const pct = (v) => (v === null || v === undefined ? "—" : num(v, 1) + "%");
+    const cell = (label, value, cls) =>
+      `<div class="m"><span>${label}</span><b class="${cls || ""}">${value}</b></div>`;
+    const hr = st.hit_rate;
+    kpis.innerHTML =
+      cell("Hit rate", pct(hr), hr === null ? "" : hr >= 50 ? "up" : "down") +
+      cell("Edge vs coin flip", st.edge === null || st.edge === undefined ? "—" : signed(st.edge, 1), st.edge > 0 ? "up" : st.edge < 0 ? "down" : "") +
+      cell("Graded calls", st.graded) +
+      cell("Awaiting", st.open) +
+      cell("Brier score", st.brier === null ? "—" : num(st.brier, 3), st.brier !== null && st.brier < 0.25 ? "up" : "") +
+      cell("Band coverage", pct(st.band_coverage)) +
+      cell("Move error", st.mae_pct === null ? "—" : num(st.mae_pct, 2) + "%") +
+      cell("Avg confidence", pct(st.avg_confidence));
+
+    const meta = $("scoreMeta");
+    if (meta) {
+      meta.textContent = st.settled
+        ? `${st.settled} forecasts settled · ${st.open} still running · lower Brier is better (0.25 = coin flip)`
+        : "Every forecast is graded against the real price once its horizon elapses";
+    }
+
+    const models = $("scoreModels");
+    models.innerHTML = (st.by_model || []).length
+      ? st.by_model
+          .map(
+            (m) =>
+              `<tr><td>${m.name}</td><td>${m.n}</td><td class="${m.hit_rate >= 50 ? "up" : "down"}">${num(m.hit_rate, 1)}%</td><td class="${m.edge >= 0 ? "up" : "down"}">${signed(m.edge, 1)}</td></tr>`
+          )
+          .join("")
+      : `<tr><td colspan="4" class="hint">No settled calls yet — the first 1m forecasts mature after ~15 minutes.</td></tr>`;
+
+    const cal = $("scoreCal");
+    cal.innerHTML = (st.calibration || []).length
+      ? st.calibration
+          .map((c) => {
+            const w = Math.max(2, Math.min(100, c.realized));
+            const good = Math.abs(c.gap) <= 10;
+            return `<div class="cal">
+              <span class="cal-l">${c.bucket}<i>n=${c.n}</i></span>
+              <span class="cal-bar"><i class="${good ? "up" : "down"}" style="width:${w}%"></i><em style="left:${Math.min(100, c.predicted)}%"></em></span>
+              <span class="cal-v ${good ? "up" : "down"}">${num(c.realized, 0)}% vs ${num(c.predicted, 0)}%</span>
+            </div>`;
+          })
+          .join("")
+      : `<p class="hint">Calibration appears once calls settle in each probability bucket.</p>`;
+
+    const pending = $("scorePending");
+    pending.innerHTML = (st.pending || []).length
+      ? st.pending
+          .map(
+            (p) =>
+              `<div class="row"><span>${p.symbol}</span><span class="${p.direction === "up" ? "up" : p.direction === "down" ? "down" : "flat"}">${p.direction}</span><span>${num(p.probability_up, 0)}%</span><span class="muted">${p.due_in > 60 ? Math.round(p.due_in / 60) + "m" : Math.round(p.due_in) + "s"}</span></div>`
+          )
+          .join("")
+      : `<p class="hint">No forecasts in flight.</p>`;
+
+    const recent = $("scoreRecent");
+    recent.innerHTML = (st.recent || []).length
+      ? st.recent
+          .map((r) => {
+            const res =
+              r.hit === null || r.hit === undefined
+                ? `<span class="muted">no call</span>`
+                : r.hit
+                ? `<span class="up">hit</span>`
+                : `<span class="down">miss</span>`;
+            return `<tr><td><b>${r.symbol}</b></td><td>${r.timeframe}</td>
+              <td class="${r.direction === "up" ? "up" : r.direction === "down" ? "down" : "flat"}">${r.direction}</td>
+              <td>${num(r.probability_up, 0)}%</td>
+              <td class="${r.expected_move_pct >= 0 ? "up" : "down"}">${signed(r.expected_move_pct)}%</td>
+              <td class="${r.actual_move_pct >= 0 ? "up" : "down"}">${signed(r.actual_move_pct)}%</td>
+              <td>${res}</td></tr>`;
+          })
+          .join("")
+      : `<tr><td colspan="7" class="hint">Nothing graded yet.</td></tr>`;
+  }
+
+  async function loadScore() {
+    try {
+      renderScore(await get("/api/forecasts/accuracy"));
+    } catch (err) {
+      console.warn("score", err);
+    }
+  }
+
   // --------------------------------------------------------------- loading
   async function load(sym, predictToo) {
     if (busy) return;
@@ -401,6 +490,7 @@
   function tick() {
     if (!active()) return;
     loadBoards();
+    loadScore();
     load(symbol, false);
   }
 
@@ -451,6 +541,7 @@
           if (cur && symbols().indexOf(cur) >= 0) symbol = cur;
           load(symbol, true);
           loadBoards();
+          loadScore();
         }
       };
     });
@@ -459,7 +550,7 @@
     timer = setInterval(tick, 15000);
   }
 
-  window.MTFView = { load, boot, runPredict };
+  window.MTFView = { load, boot, runPredict, loadScore };
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
   else boot();
 })();
