@@ -21,6 +21,7 @@ from app.engine import Robot
 from app.market.hub import MarketHub
 from app.market.rest import fetch_klines, fetch_universe
 from app.market.venues import MARKETS, VENUES
+from app.universe import PRESETS as UNIVERSE_PRESETS, SORTS as UNIVERSE_SORTS
 from app.predict import HORIZONS
 from app.rules import COMPARATORS, field_catalog
 from app.screener import (
@@ -191,6 +192,12 @@ async def api_instruments(
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     min_volume: float = 0.0,
+    max_volume: float = 0.0,
+    change_min: float | None = None,
+    change_max: float | None = None,
+    funding_min: float | None = None,
+    funding_max: float | None = None,
+    preset: str = "",
 ):
     """Every listed instrument across venues and market types."""
     if robot.instruments.stale and not robot.instruments.loading:
@@ -204,7 +211,52 @@ async def api_instruments(
         limit=limit,
         offset=offset,
         min_volume=min_volume,
+        max_volume=max_volume,
+        change_min=change_min,
+        change_max=change_max,
+        funding_min=funding_min,
+        funding_max=funding_max,
+        preset=preset,
     )
+
+
+@app.get("/api/instruments/presets")
+async def api_instruments_presets():
+    return {
+        "presets": UNIVERSE_PRESETS,
+        "venues": list(VENUES),
+        "markets": list(MARKETS),
+        "sorts": sorted(UNIVERSE_SORTS),
+    }
+
+
+@app.get("/api/instruments/carry")
+async def api_instruments_carry(
+    quote: str = "USDT", limit: int = Query(20, ge=1, le=100), min_volume: float = 1e6
+):
+    """Cash-and-carry ranking: cheapest spot venue vs the best-paying perp."""
+    return {
+        "rows": robot.instruments.carry(quote=quote, limit=limit, min_volume=min_volume),
+        "source": robot.instruments.report.get("source"),
+        "note": "funding APR + basis, before fees, borrow and slippage",
+    }
+
+
+@app.get("/api/instruments/exclusives")
+async def api_instruments_exclusives(limit: int = Query(30, ge=1, le=200), min_volume: float = 0.0):
+    """Coins listed on exactly one venue."""
+    return {
+        "rows": robot.instruments.exclusives(limit=limit, min_volume=min_volume),
+        "source": robot.instruments.report.get("source"),
+    }
+
+
+@app.get("/api/instruments/movers")
+async def api_instruments_movers(
+    quote: str = "USDT", limit: int = Query(15, ge=1, le=100), min_volume: float = 2e6
+):
+    """Best and worst 24h movers across every venue, one row per coin."""
+    return robot.instruments.movers(quote=quote, limit=limit, min_volume=min_volume)
 
 
 @app.get("/api/instruments/stats")

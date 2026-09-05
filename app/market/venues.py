@@ -31,8 +31,13 @@ from app.market.catalog_seed import offline_catalog
 
 log = logging.getLogger("venues")
 
-VENUES = ("binance", "bybit", "okx", "mexc")
-MARKETS = ("spot", "futures")
+VENUES = ("binance", "bybit", "okx", "mexc", "kucoin", "gate", "bitget", "htx")
+
+# spot · linear (USDT/USDC-margined) perps · inverse (coin-margined) contracts
+MARKETS = ("spot", "futures", "inverse")
+
+# quotes that mean "linear/stable-margined"; anything settled in USD is inverse
+STABLES = ("USDT", "USDC", "FDUSD", "TUSD", "DAI", "USDE")
 
 # quote assets we care about (everything else is dropped to keep the index sane)
 QUOTES = ("USDT", "USDC", "USD", "BTC", "ETH", "FDUSD", "EUR", "TRY", "BNB")
@@ -48,6 +53,11 @@ def _f(value: Any, default: float = 0.0) -> float:
     if out != out or out in (float("inf"), float("-inf")):
         return default
     return out
+
+
+def _market_for(quote: str, default: str = "futures") -> str:
+    """Coin-margined contracts are quoted in USD; stable-margined ones are linear."""
+    return default if quote in STABLES else "inverse"
 
 
 def _pct_maybe_fraction(value: Any) -> float:
@@ -96,8 +106,13 @@ def instrument(
     source: str = "rest",
 ) -> dict[str, Any]:
     symbol = f"{base}/{quote}" if quote else base
+    kind = contract or ("perpetual" if market in ("futures", "inverse") else "spot")
+    # dated contracts share a symbol with the perp, so key them by their raw id
+    ident = f"{venue}:{market}:{symbol}"
+    if kind.startswith("dated"):
+        ident = f"{ident}:{raw}"
     return {
-        "id": f"{venue}:{market}:{symbol}",
+        "id": ident,
         "venue": venue,
         "market": market,
         "symbol": symbol,
@@ -111,7 +126,7 @@ def instrument(
         "low": round(low, 10),
         "funding_rate": funding_rate,
         "open_interest": open_interest,
-        "contract": contract or ("perpetual" if market == "futures" else "spot"),
+        "contract": kind,
         "source": source,
     }
 
@@ -190,6 +205,48 @@ async def binance_futures(client: httpx.AsyncClient) -> list[dict[str, Any]]:
     return out
 
 
+async def binance_inverse(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    """COIN-margined perps and dated futures (BTCUSD_PERP, ETHUSD_240628)."""
+    r = await client.get("https://dapi.binance.com/dapi/v1/ticker/24hr")
+    r.raise_for_status()
+    funding: dict[str, float] = {}
+    try:
+        pr = await client.get("https://dapi.binance.com/dapi/v1/premiumIndex")
+        pr.raise_for_status()
+        for row in pr.json():
+            funding[str(row.get("symbol"))] = _f(row.get("lastFundingRate"))
+    except Exception as exc:
+        log.debug("binance inverse funding: %s", exc)
+    out = []
+    for row in r.json():
+        raw = str(row.get("symbol") or "")
+        head = raw.split("_")[0]
+        base, quote = split_symbol(head)
+        if not quote:
+            continue
+        last = _f(row.get("lastPrice"))
+        if last <= 0:
+            continue
+        expiry = raw.split("_")[1] if "_" in raw else "PERP"
+        out.append(
+            instrument(
+                "binance",
+                "inverse",
+                base,
+                quote,
+                raw,
+                last,
+                _f(row.get("priceChangePercent")),
+                _f(row.get("baseVolume")) * last,
+                _f(row.get("highPrice")),
+                _f(row.get("lowPrice")),
+                funding_rate=funding.get(raw),
+                contract="perpetual" if expiry == "PERP" else f"dated {expiry}",
+            )
+        )
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Bybit
 # --------------------------------------------------------------------------- #
@@ -233,6 +290,10 @@ async def bybit_spot(client: httpx.AsyncClient) -> list[dict[str, Any]]:
 
 async def bybit_futures(client: httpx.AsyncClient) -> list[dict[str, Any]]:
     return await _bybit(client, "linear", "futures")
+
+
+async def bybit_inverse(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    return await _bybit(client, "inverse", "inverse")
 
 
 # --------------------------------------------------------------------------- #
@@ -291,7 +352,13 @@ async def okx_spot(client: httpx.AsyncClient) -> list[dict[str, Any]]:
 
 
 async def okx_futures(client: httpx.AsyncClient) -> list[dict[str, Any]]:
-    return await _okx(client, "SWAP", "futures")
+    rows = await _okx(client, "SWAP", "futures")
+    return [r for r in rows if r["quote"] in STABLES]
+
+
+async def okx_inverse(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    rows = await _okx(client, "SWAP", "inverse")
+    return [r for r in rows if r["quote"] not in STABLES]
 
 
 # --------------------------------------------------------------------------- #
@@ -360,15 +427,336 @@ async def mexc_futures(client: httpx.AsyncClient) -> list[dict[str, Any]]:
     return out
 
 
+
+# --------------------------------------------------------------------------- #
+# KuCoin
+# --------------------------------------------------------------------------- #
+
+# KuCoin still calls bitcoin XBT on the derivatives side
+_KUCOIN_ALIAS = {"XBT": "BTC"}
+
+
+async def kucoin_spot(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    r = await client.get("https://api.kucoin.com/api/v1/market/allTickers")
+    r.raise_for_status()
+    rows = ((r.json() or {}).get("data") or {}).get("ticker") or []
+    out = []
+    for row in rows:
+        raw = str(row.get("symbol") or "")
+        base, quote = split_symbol(raw)
+        if not quote or quote not in QUOTES:
+            continue
+        last = _f(row.get("last"))
+        if last <= 0:
+            continue
+        out.append(
+            instrument(
+                "kucoin",
+                "spot",
+                _KUCOIN_ALIAS.get(base, base),
+                quote,
+                raw,
+                last,
+                _f(row.get("changeRate")) * 100.0,
+                _f(row.get("volValue")),
+                _f(row.get("high")),
+                _f(row.get("low")),
+            )
+        )
+    return out
+
+
+async def _kucoin_contracts(client: httpx.AsyncClient, market: str) -> list[dict[str, Any]]:
+    r = await client.get("https://api-futures.kucoin.com/api/v1/contracts/active")
+    r.raise_for_status()
+    out = []
+    for row in (r.json() or {}).get("data") or []:
+        raw = str(row.get("symbol") or "")
+        base = _KUCOIN_ALIAS.get(str(row.get("baseCurrency") or "").upper(), str(row.get("baseCurrency") or "").upper())
+        quote = str(row.get("quoteCurrency") or "").upper()
+        if not base or quote not in QUOTES:
+            continue
+        kind = _market_for(quote)
+        if kind != market:
+            continue
+        last = _f(row.get("lastTradePrice"))
+        if last <= 0:
+            continue
+        out.append(
+            instrument(
+                "kucoin",
+                market,
+                base,
+                quote,
+                raw,
+                last,
+                _f(row.get("priceChgPct")) * 100.0,
+                _f(row.get("turnoverOf24h")),
+                _f(row.get("highPrice")),
+                _f(row.get("lowPrice")),
+                funding_rate=_f(row.get("fundingFeeRate")) or None,
+                open_interest=_f(row.get("openInterest")) * last or None,
+                contract="perpetual" if str(row.get("type") or "FFWCSX") == "FFWCSX" else "dated",
+            )
+        )
+    return out
+
+
+async def kucoin_futures(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    return await _kucoin_contracts(client, "futures")
+
+
+async def kucoin_inverse(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    return await _kucoin_contracts(client, "inverse")
+
+
+# --------------------------------------------------------------------------- #
+# Gate.io
+# --------------------------------------------------------------------------- #
+
+
+async def gate_spot(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    r = await client.get("https://api.gateio.ws/api/v4/spot/tickers")
+    r.raise_for_status()
+    out = []
+    for row in r.json():
+        raw = str(row.get("currency_pair") or "")
+        base, quote = split_symbol(raw)
+        if not quote or quote not in QUOTES:
+            continue
+        last = _f(row.get("last"))
+        if last <= 0:
+            continue
+        out.append(
+            instrument(
+                "gate",
+                "spot",
+                base,
+                quote,
+                raw,
+                last,
+                _f(row.get("change_percentage")),
+                _f(row.get("quote_volume")),
+                _f(row.get("high_24h")),
+                _f(row.get("low_24h")),
+            )
+        )
+    return out
+
+
+async def _gate_futures(client: httpx.AsyncClient, settle: str, market: str) -> list[dict[str, Any]]:
+    r = await client.get(f"https://api.gateio.ws/api/v4/futures/{settle}/tickers")
+    r.raise_for_status()
+    out = []
+    for row in r.json():
+        raw = str(row.get("contract") or "")
+        base, quote = split_symbol(raw)
+        if not quote or quote not in QUOTES:
+            continue
+        last = _f(row.get("last"))
+        if last <= 0:
+            continue
+        volume = _f(row.get("volume_24h_quote")) or _f(row.get("volume_24h_settle")) * last
+        out.append(
+            instrument(
+                "gate",
+                market,
+                base,
+                quote,
+                raw,
+                last,
+                _f(row.get("change_percentage")),
+                volume,
+                _f(row.get("high_24h")),
+                _f(row.get("low_24h")),
+                funding_rate=_f(row.get("funding_rate")) or None,
+                open_interest=_f(row.get("total_size")) * last or None,
+            )
+        )
+    return out
+
+
+async def gate_futures(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    return await _gate_futures(client, "usdt", "futures")
+
+
+async def gate_inverse(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    return await _gate_futures(client, "btc", "inverse")
+
+
+# --------------------------------------------------------------------------- #
+# Bitget
+# --------------------------------------------------------------------------- #
+
+
+async def bitget_spot(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    r = await client.get("https://api.bitget.com/api/v2/spot/market/tickers")
+    r.raise_for_status()
+    out = []
+    for row in (r.json() or {}).get("data") or []:
+        raw = str(row.get("symbol") or "")
+        base, quote = split_symbol(raw)
+        if not quote or quote not in QUOTES:
+            continue
+        last = _f(row.get("lastPr"))
+        if last <= 0:
+            continue
+        out.append(
+            instrument(
+                "bitget",
+                "spot",
+                base,
+                quote,
+                raw,
+                last,
+                _pct_maybe_fraction(row.get("change24h")),
+                _f(row.get("usdtVolume")),
+                _f(row.get("high24h")),
+                _f(row.get("low24h")),
+            )
+        )
+    return out
+
+
+async def _bitget_mix(client: httpx.AsyncClient, product: str, market: str) -> list[dict[str, Any]]:
+    r = await client.get(
+        "https://api.bitget.com/api/v2/mix/market/tickers", params={"productType": product}
+    )
+    r.raise_for_status()
+    out = []
+    for row in (r.json() or {}).get("data") or []:
+        raw = str(row.get("symbol") or "")
+        base, quote = split_symbol(raw)
+        if not quote or quote not in QUOTES:
+            continue
+        last = _f(row.get("lastPr"))
+        if last <= 0:
+            continue
+        out.append(
+            instrument(
+                "bitget",
+                market,
+                base,
+                quote,
+                raw,
+                last,
+                _pct_maybe_fraction(row.get("change24h")),
+                _f(row.get("usdtVolume")),
+                _f(row.get("high24h")),
+                _f(row.get("low24h")),
+                funding_rate=_f(row.get("fundingRate")) or None,
+                open_interest=_f(row.get("holdingAmount")) * last or None,
+            )
+        )
+    return out
+
+
+async def bitget_futures(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    return await _bitget_mix(client, "USDT-FUTURES", "futures")
+
+
+async def bitget_inverse(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    return await _bitget_mix(client, "COIN-FUTURES", "inverse")
+
+
+# --------------------------------------------------------------------------- #
+# HTX (Huobi)
+# --------------------------------------------------------------------------- #
+
+
+async def htx_spot(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    r = await client.get("https://api.huobi.pro/market/tickers")
+    r.raise_for_status()
+    out = []
+    for row in (r.json() or {}).get("data") or []:
+        raw = str(row.get("symbol") or "").upper()
+        base, quote = split_symbol(raw)
+        if not quote or quote not in QUOTES:
+            continue
+        last = _f(row.get("close"))
+        open_px = _f(row.get("open"))
+        if last <= 0:
+            continue
+        out.append(
+            instrument(
+                "htx",
+                "spot",
+                base,
+                quote,
+                raw,
+                last,
+                ((last / open_px - 1) * 100.0) if open_px else 0.0,
+                _f(row.get("vol")),
+                _f(row.get("high")),
+                _f(row.get("low")),
+            )
+        )
+    return out
+
+
+async def htx_futures(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    """USDT-margined swaps."""
+    r = await client.get("https://api.hbdm.com/v2/linear-swap-ex/market/detail/batch_merged")
+    r.raise_for_status()
+    funding: dict[str, float] = {}
+    try:
+        fr = await client.get("https://api.hbdm.com/linear-swap-api/v1/swap_batch_funding_rate")
+        fr.raise_for_status()
+        for row in (fr.json() or {}).get("data") or []:
+            funding[str(row.get("contract_code"))] = _f(row.get("funding_rate"))
+    except Exception as exc:
+        log.debug("htx funding: %s", exc)
+    out = []
+    for row in (r.json() or {}).get("ticks") or []:
+        raw = str(row.get("contract_code") or "")
+        base, quote = split_symbol(raw)
+        if not quote or quote not in QUOTES:
+            continue
+        last = _f(row.get("close"))
+        open_px = _f(row.get("open"))
+        if last <= 0:
+            continue
+        out.append(
+            instrument(
+                "htx",
+                _market_for(quote),
+                base,
+                quote,
+                raw,
+                last,
+                ((last / open_px - 1) * 100.0) if open_px else 0.0,
+                _f(row.get("trade_turnover")),
+                _f(row.get("high")),
+                _f(row.get("low")),
+                funding_rate=funding.get(raw),
+            )
+        )
+    return out
+
+
 FETCHERS: dict[tuple[str, str], Callable[[httpx.AsyncClient], Any]] = {
     ("binance", "spot"): binance_spot,
     ("binance", "futures"): binance_futures,
+    ("binance", "inverse"): binance_inverse,
     ("bybit", "spot"): bybit_spot,
     ("bybit", "futures"): bybit_futures,
+    ("bybit", "inverse"): bybit_inverse,
     ("okx", "spot"): okx_spot,
     ("okx", "futures"): okx_futures,
+    ("okx", "inverse"): okx_inverse,
     ("mexc", "spot"): mexc_spot,
     ("mexc", "futures"): mexc_futures,
+    ("kucoin", "spot"): kucoin_spot,
+    ("kucoin", "futures"): kucoin_futures,
+    ("kucoin", "inverse"): kucoin_inverse,
+    ("gate", "spot"): gate_spot,
+    ("gate", "futures"): gate_futures,
+    ("gate", "inverse"): gate_inverse,
+    ("bitget", "spot"): bitget_spot,
+    ("bitget", "futures"): bitget_futures,
+    ("bitget", "inverse"): bitget_inverse,
+    ("htx", "spot"): htx_spot,
+    ("htx", "futures"): htx_futures,
 }
 
 

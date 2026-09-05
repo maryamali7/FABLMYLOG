@@ -36,13 +36,18 @@ def test_instrument_shape_is_canonical():
 
 def test_offline_catalog_covers_all_venues_and_markets():
     rows = offline_catalog()
-    assert len(rows) > 400
+    assert len(rows) > 3000, "the offline catalog should look like a real multi-venue book"
+    assert len({r["base"] for r in rows}) > 250
     assert {r["venue"] for r in rows} == set(VENUES)
     assert {r["market"] for r in rows} == set(MARKETS)
     assert all(r["source"] == "offline" for r in rows), "offline rows must be flagged"
     for venue in VENUES:
-        for market in MARKETS:
+        for market in ("spot", "futures"):
             assert any(r["venue"] == venue and r["market"] == market for r in rows), f"{venue}:{market}"
+    # coin-margined books exist, but only where the venue actually runs them
+    inverse = [r for r in rows if r["market"] == "inverse"]
+    assert inverse and all(r["quote"] == "USD" for r in inverse)
+    assert len({r["venue"] for r in inverse}) >= 5
     # futures rows carry derivative-only fields
     perps = [r for r in rows if r["market"] == "futures"]
     assert all(r["funding_rate"] is not None and r["open_interest"] for r in perps)
@@ -139,7 +144,7 @@ def test_stats_totals_match_rows():
     u = build()
     st = u.stats()
     assert st["instruments"] == len(u.rows)
-    assert st["spot"] + st["futures"] == st["instruments"]
+    assert st["spot"] + st["futures"] + st["inverse"] == st["instruments"]
     assert sum(v["total"] for v in st["venues"]) == st["instruments"]
     assert st["source"] == "offline"
     assert {v["venue"] for v in st["venues"]} == set(VENUES)
@@ -182,5 +187,91 @@ def test_offline_report_lists_every_partition():
     u = Universe()
     report = asyncio.run(u.refresh())
     if report["source"] == "offline":
-        assert len(report["ok"]) == len(VENUES) * len(MARKETS)
+        partitions = {(r["venue"], r["market"]) for r in u.rows}
+        assert len(report["ok"]) == len(partitions)
+        assert sum(o["count"] for o in report["ok"]) == len(u.rows)
         assert all(o.get("offline") for o in report["ok"])
+
+
+def test_presets_are_valid_and_applied():
+    from app.universe import PRESETS, SORTS
+
+    u = build()
+    ids = [p["id"] for p in PRESETS]
+    assert len(ids) == len(set(ids))
+    for p in PRESETS:
+        assert p["label"] and p["desc"]
+        sort = p["params"].get("sort", "volume")
+        assert sort in SORTS, p["id"]
+        res = u.query(preset=p["id"], limit=25)
+        assert res["preset"] == p["id"]
+        for r in res["rows"]:
+            if "market" in p["params"]:
+                assert r["market"] == p["params"]["market"]
+            if "quote" in p["params"]:
+                assert r["quote"] == p["params"]["quote"]
+            if p["params"].get("min_volume"):
+                assert r["volume_usd"] >= p["params"]["min_volume"]
+            if p["params"].get("max_volume"):
+                assert r["volume_usd"] <= p["params"]["max_volume"]
+            if p["params"].get("funding_max") is not None:
+                assert r["funding_rate"] is not None
+                assert r["funding_rate"] <= p["params"]["funding_max"]
+
+
+def test_numeric_range_filters():
+    u = build()
+    up = u.query(change_min=3.0, limit=500)
+    assert up["rows"] and all(r["change_pct"] >= 3.0 for r in up["rows"])
+    band = u.query(change_min=-1.0, change_max=1.0, limit=500)
+    assert all(-1.0 <= r["change_pct"] <= 1.0 for r in band["rows"])
+    paying = u.query(funding_min=0.0002, limit=500)
+    assert paying["rows"] and all(r["funding_rate"] >= 0.0002 for r in paying["rows"])
+    thin = u.query(max_volume=1e6, limit=500)
+    assert all(r["volume_usd"] <= 1e6 for r in thin["rows"])
+
+
+def test_inverse_market_is_indexed():
+    u = build()
+    inv = u.query(market="inverse", limit=500)
+    assert inv["total"] > 0
+    assert all(r["market"] == "inverse" and r["quote"] == "USD" for r in inv["rows"])
+    st = u.stats()
+    assert st["inverse"] == inv["total"]
+    assert any(v["inverse"] > 0 for v in st["venues"])
+
+
+def test_carry_ranks_funding_plus_basis():
+    u = build()
+    rows = u.carry(limit=15, min_volume=0)
+    assert rows
+    for r in rows:
+        assert r["spot_venue"] and r["perp_venue"]
+        assert r["carry_apr"] == pytest.approx(r["funding_apr"] + r["basis_pct"], abs=1e-2)
+    assert [r["carry_apr"] for r in rows] == sorted([r["carry_apr"] for r in rows], reverse=True)
+
+
+def test_exclusives_are_single_venue_coins():
+    u = build()
+    rows = u.exclusives(limit=50)
+    assert rows
+    for r in rows:
+        listed = {x["venue"] for x in u.rows if x["base"] == r["base"]}
+        assert listed == {r["venue"]}, r["base"]
+
+
+def test_movers_dedupe_per_coin():
+    u = build()
+    data = u.movers(limit=10, min_volume=0)
+    assert len(data["gainers"]) == 10 and len(data["losers"]) == 10
+    assert len({r["base"] for r in data["gainers"]}) == 10
+    assert data["gainers"][0]["change_pct"] >= data["gainers"][-1]["change_pct"]
+    assert data["losers"][0]["change_pct"] <= data["losers"][-1]["change_pct"]
+
+
+def test_eight_venues_are_indexed():
+    u = build()
+    st = u.stats()
+    assert len(st["venues"]) == 8
+    assert {v["venue"] for v in st["venues"]} == set(VENUES)
+    assert st["instruments"] > 3000 and st["coins"] > 250

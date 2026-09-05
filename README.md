@@ -52,7 +52,7 @@ Binance REST ─┘
         ▼                        ▼
   MTFEngine (1m…1w)        Rule frames / screener
         │                        │
-  Universe index ── Binance / Bybit / OKX / MEXC · spot + futures catalogs
+  Universe index ── 8 venues · spot / linear perps / coin-margined (22 catalogs)
         │                        │
         └────────► Forecast ensemble (6 models)
                     │
@@ -197,37 +197,55 @@ The backtester rebuilds the higher timeframes from the same candles and replays 
 without look-ahead. Results list which frames were replayed, and warn when a rule uses a
 live-only forecast field that cannot be simulated.
 
-## Instrument universe (Binance · Bybit · OKX · MEXC)
+## Instrument universe (8 venues · spot · perps · coin-margined)
 
-The **Universe** view indexes *every* instrument on four venues — spot **and** futures — from
-their public, key-free ticker endpoints:
+The **Universe** view indexes *every* instrument on eight venues across three market types,
+from public, key-free endpoints — 22 catalogs pulled in parallel:
 
-| Venue | Spot | Futures |
-|---|---|---|
-| Binance | `api/v3/ticker/24hr` | `fapi/v1/ticker/24hr` + `premiumIndex` (funding) |
-| Bybit | `v5/market/tickers?category=spot` | `category=linear` (funding, open interest) |
-| OKX | `v5/market/tickers?instType=SPOT` | `instType=SWAP` + `public/open-interest` |
-| MEXC | `api/v3/ticker/24hr` | `contract/api/v1/contract/ticker` (funding, holdVol) |
+| Venue | Spot | Linear perps | Coin-margined |
+|---|---|---|---|
+| Binance | `api/v3/ticker/24hr` | `fapi` ticker + `premiumIndex` | `dapi` ticker + premium (perp & dated) |
+| Bybit | `v5/market/tickers?category=spot` | `category=linear` | `category=inverse` |
+| OKX | `instType=SPOT` | `instType=SWAP` (stable-margined) | `instType=SWAP` (USD-margined) |
+| MEXC | `api/v3/ticker/24hr` | `contract/api/v1/contract/ticker` | — |
+| KuCoin | `market/allTickers` | `contracts/active` (XBT→BTC) | `contracts/active` USD-quoted |
+| Gate.io | `v4/spot/tickers` | `v4/futures/usdt/tickers` | `v4/futures/btc/tickers` |
+| Bitget | `v2/spot/market/tickers` | `USDT-FUTURES` | `COIN-FUTURES` |
+| HTX | `market/tickers` | `linear-swap` + batch funding | — |
 
-Everything is normalized into one row shape (`venue`, `market`, `symbol`, `base`, `quote`,
-`last`, `change_pct`, `volume_usd`, `funding_rate`, `open_interest`, `contract`, `source`) and
-indexed in memory with a 15-minute TTL refresh, so the browser can:
+Everything is normalized into one row (`venue`, `market`, `symbol`, `base`, `quote`, `last`,
+`change_pct`, `volume_usd`, `funding_rate`, `open_interest`, `contract`, `source`) and indexed
+in memory with a 15-minute TTL refresh. Dated contracts keep their own id, so a September
+future never overwrites the perp.
 
-- **filter** by venue chips, market type (spot / perps), quote asset, minimum volume and free text;
-- **sort** by volume, gainers, losers, funding, open interest or price;
-- flip to **per-coin mode**, which merges every listing of an asset and shows how many venues
-  list it, spot vs perp coverage, aggregate volume and the cross-venue price spread;
-- read the **cross-venue spread** board (cheapest venue vs richest venue for the same coin) and
-  the **funding & basis** board (who pays funding, funding APR, perp premium/discount to spot);
-- **watch** any instrument — one click appends it to the live watchlist, capped by
-  `max_watch_symbols`;
-- export the current filter to CSV.
+**Browsing**
+
+- venue chips (8), market chips (spot / linear perps / coin-margined), quote, free text;
+- numeric filters: min & max volume, 24h change band, funding band;
+- sorts: volume (high/low), gainers, losers, funding (high/low), open interest, price, symbol, venue;
+- **10 one-click presets** — volume leaders, gainers, losers, perps only, coin-margined,
+  funding squeeze, shorts pay, open-interest leaders, illiquid, USDC books;
+- **per-coin mode** merges every listing of an asset: how many venues list it, spot vs perp
+  coverage, aggregate volume, cross-venue spread, average funding;
+- click any symbol for a **coin drawer** with every listing side by side (price, 24h, volume,
+  funding, OI, contract type) plus the venue spread and a one-click watch;
+- CSV export of the current filter, and watch buttons that push instruments into the live
+  watchlist (capped by `max_watch_symbols`).
+
+**Cross-venue boards**
+
+- **Spread** — same coin, cheapest venue vs richest, spot or perps.
+- **Funding & basis** — who pays funding, funding APR, perp premium/discount to spot.
+- **Cash-and-carry** — buy spot on the cheapest venue, short the best-paying perp;
+  `carry_apr = funding APR + basis`, before fees, borrow and slippage.
+- **24h movers** — best and worst performers across all venues, deduped per coin.
+- **Venue exclusives** — coins listed on exactly one venue (listing alpha, and listing risk).
 
 If every venue is unreachable (air-gapped host, blocked TLS, exchange outage) the index falls
-back to a bundled offline catalog with **simulated prices**. Those rows are tagged
-`source: "offline"` and the UI shows a red banner saying so — simulated data is never presented
-as market data. A partial success is never overwritten: if three catalogs load and one fails,
-you get the three plus a listed failure.
+back to a bundled offline catalog — ~4,000 instruments over 310 coins with **simulated prices**.
+Those rows are tagged `source: "offline"` and the UI shows a red banner saying so; simulated
+data is never presented as market data. Partial success is never overwritten: if twenty
+catalogs load and two fail, you get the twenty plus the two listed failures.
 
 ## Alert rules & analytics
 
@@ -267,6 +285,10 @@ per-exit-reason and hourly edge tables, streaks, a PnL histogram and equity-curv
 | GET | `/api/instruments/export.csv` | CSV of the current filter |
 | POST | `/api/instruments/refresh` | re-pull catalogs (optionally one venue/market) |
 | POST | `/api/instruments/watch` | add instruments to the live watchlist |
+| GET | `/api/instruments/presets` | preset screens, venue and market lists |
+| GET | `/api/instruments/carry` | cash-and-carry ranking (funding APR + basis) |
+| GET | `/api/instruments/movers` | 24h gainers and losers across all venues |
+| GET | `/api/instruments/exclusives` | coins listed on a single venue |
 
 ## Config
 

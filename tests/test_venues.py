@@ -52,6 +52,71 @@ SAMPLES = {
         {"symbol": "PEPEUSDT", "lastPrice": "0.0000082", "priceChangePercent": "0.0345",
          "quoteVolume": "31000000", "highPrice": "0.0000090", "lowPrice": "0.0000079"},
     ],
+    "https://dapi.binance.com/dapi/v1/ticker/24hr": [
+        {"symbol": "BTCUSD_PERP", "lastPrice": "64100", "priceChangePercent": "1.10",
+         "baseVolume": "12000", "highPrice": "65000", "lowPrice": "63000"},
+        {"symbol": "ETHUSD_240927", "lastPrice": "3250", "priceChangePercent": "0.9",
+         "baseVolume": "5000", "highPrice": "3300", "lowPrice": "3200"},
+    ],
+    "https://dapi.binance.com/dapi/v1/premiumIndex": [
+        {"symbol": "BTCUSD_PERP", "lastFundingRate": "0.00009"},
+    ],
+    "https://api.kucoin.com/api/v1/market/allTickers": {
+        "data": {"ticker": [
+            {"symbol": "BTC-USDT", "last": "64050", "changeRate": "0.0118",
+             "volValue": "300000000", "high": "65000", "low": "63000"},
+        ]}
+    },
+    "https://api-futures.kucoin.com/api/v1/contracts/active": {
+        "data": [
+            {"symbol": "XBTUSDTM", "baseCurrency": "XBT", "quoteCurrency": "USDT", "type": "FFWCSX",
+             "lastTradePrice": 64060, "priceChgPct": 0.012, "turnoverOf24h": 900000000,
+             "fundingFeeRate": 0.00007, "openInterest": "5000", "highPrice": 65000, "lowPrice": 63100},
+            {"symbol": "XBTUSDM", "baseCurrency": "XBT", "quoteCurrency": "USD", "type": "FFWCSX",
+             "lastTradePrice": 64070, "priceChgPct": 0.011, "turnoverOf24h": 120000000,
+             "fundingFeeRate": 0.0001, "openInterest": "800"},
+        ]
+    },
+    "https://api.gateio.ws/api/v4/spot/tickers": [
+        {"currency_pair": "PEPE_USDT", "last": "0.0000081", "change_percentage": "2.4",
+         "quote_volume": "18000000", "high_24h": "0.0000085", "low_24h": "0.0000078"},
+    ],
+    "https://api.gateio.ws/api/v4/futures/usdt/tickers": [
+        {"contract": "SOL_USDT", "last": "150.1", "change_percentage": "1.9",
+         "volume_24h_quote": "220000000", "funding_rate": "0.00013", "total_size": "900000"},
+    ],
+    "https://api.gateio.ws/api/v4/futures/btc/tickers": [
+        {"contract": "BTC_USD", "last": "64080", "change_percentage": "1.0",
+         "volume_24h_quote": "9000000", "funding_rate": "0.00005", "total_size": "1200"},
+    ],
+    "https://api.bitget.com/api/v2/spot/market/tickers": {
+        "data": [
+            {"symbol": "ETHUSDT", "lastPr": "3210", "change24h": "0.0075",
+             "usdtVolume": "88000000", "high24h": "3300", "low24h": "3180"},
+        ]
+    },
+    "https://api.bitget.com/api/v2/mix/market/tickers": {
+        "data": [
+            {"symbol": "ETHUSDT", "lastPr": "3212", "change24h": "0.0080",
+             "usdtVolume": "410000000", "fundingRate": "0.00011",
+             "holdingAmount": "150000", "high24h": "3305", "low24h": "3185"},
+        ]
+    },
+    "https://api.huobi.pro/market/tickers": {
+        "data": [
+            {"symbol": "btcusdt", "close": 64090, "open": 63500, "high": 65000,
+             "low": 63200, "vol": 240000000},
+        ]
+    },
+    "https://api.hbdm.com/v2/linear-swap-ex/market/detail/batch_merged": {
+        "ticks": [
+            {"contract_code": "BTC-USDT", "close": 64095, "open": 63400,
+             "high": 65100, "low": 63300, "trade_turnover": 800000000},
+        ]
+    },
+    "https://api.hbdm.com/linear-swap-api/v1/swap_batch_funding_rate": {
+        "data": [{"contract_code": "BTC-USDT", "funding_rate": "0.00006"}]
+    },
     "https://contract.mexc.com/api/v1/contract/ticker": {
         "data": [
             {"symbol": "BTC_USDT", "lastPrice": 64030.5, "riseFallRate": 0.0131,
@@ -158,3 +223,72 @@ def test_fetch_all_keeps_partial_success(monkeypatch):
     assert len(rows) == 1
     assert report["ok"] == [{"venue": "okx", "market": "spot", "count": 1}]
     assert "okx:futures" in report["failed"]
+
+
+def test_binance_inverse_labels_perp_and_dated():
+    rows = run(V.binance_inverse)
+    assert [r["market"] for r in rows] == ["inverse", "inverse"]
+    perp = next(r for r in rows if r["base"] == "BTC")
+    dated = next(r for r in rows if r["base"] == "ETH")
+    assert perp["quote"] == "USD" and perp["contract"] == "perpetual"
+    assert perp["funding_rate"] == pytest.approx(0.00009)
+    assert dated["contract"] == "dated 240927"
+    assert dated["id"].endswith("ETHUSD_240927"), "dated contracts need their own id"
+    assert perp["id"] != dated["id"]
+
+
+def test_kucoin_maps_xbt_to_btc_and_splits_inverse():
+    spot = run(V.kucoin_spot)
+    assert spot[0]["symbol"] == "BTC/USDT"
+    assert spot[0]["change_pct"] == pytest.approx(1.18)
+    linear = run(V.kucoin_futures)
+    assert [r["symbol"] for r in linear] == ["BTC/USDT"]
+    assert linear[0]["base"] == "BTC" and linear[0]["raw"] == "XBTUSDTM"
+    assert linear[0]["funding_rate"] == pytest.approx(0.00007)
+    inverse = run(V.kucoin_inverse)
+    assert [r["market"] for r in inverse] == ["inverse"]
+    assert inverse[0]["symbol"] == "BTC/USD"
+
+
+def test_gate_spot_and_both_futures_settlements():
+    spot = run(V.gate_spot)
+    assert spot[0]["symbol"] == "PEPE/USDT" and spot[0]["change_pct"] == pytest.approx(2.4)
+    linear = run(V.gate_futures)
+    assert linear[0]["symbol"] == "SOL/USDT" and linear[0]["market"] == "futures"
+    assert linear[0]["funding_rate"] == pytest.approx(0.00013)
+    inverse = run(V.gate_inverse)
+    assert inverse[0]["symbol"] == "BTC/USD" and inverse[0]["market"] == "inverse"
+
+
+def test_bitget_fraction_change_and_mix_fields():
+    spot = run(V.bitget_spot)
+    assert spot[0]["symbol"] == "ETH/USDT"
+    assert spot[0]["change_pct"] == pytest.approx(0.75)
+    perp = run(V.bitget_futures)
+    assert perp[0]["market"] == "futures"
+    assert perp[0]["funding_rate"] == pytest.approx(0.00011)
+    assert perp[0]["open_interest"] == pytest.approx(150000 * 3212)
+
+
+def test_htx_computes_change_from_open():
+    spot = run(V.htx_spot)
+    assert spot[0]["symbol"] == "BTC/USDT"
+    assert spot[0]["change_pct"] == pytest.approx((64090 / 63500 - 1) * 100, abs=1e-3)
+    perp = run(V.htx_futures)
+    assert perp[0]["market"] == "futures"
+    assert perp[0]["funding_rate"] == pytest.approx(0.00006)
+
+
+def test_every_registered_catalog_is_callable():
+    assert len(V.FETCHERS) == 22
+    assert {k[0] for k in V.FETCHERS} == set(V.VENUES)
+    assert {k[1] for k in V.FETCHERS} == set(V.MARKETS)
+    for key, fn in V.FETCHERS.items():
+        assert callable(fn), key
+
+
+def test_market_classification_by_quote():
+    assert V._market_for("USDT") == "futures"
+    assert V._market_for("USDC") == "futures"
+    assert V._market_for("USD") == "inverse"
+    assert V._market_for("BTC") == "inverse"
