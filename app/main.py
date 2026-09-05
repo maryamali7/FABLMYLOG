@@ -22,6 +22,9 @@ from app.market.hub import MarketHub
 from app.market.rest import fetch_klines, fetch_universe
 from app.market.venues import MARKETS, VENUES
 from app.universe import PRESETS as UNIVERSE_PRESETS, SORTS as UNIVERSE_SORTS
+from app.keys import TRADABLE as TRADABLE_VENUES
+from app.models import Signal, SignalKind
+from app.runtime import Supervisor
 from app.predict import HORIZONS
 from app.rules import COMPARATORS, field_catalog
 from app.screener import (
@@ -98,6 +101,9 @@ async def pulse() -> None:
         await asyncio.sleep(1.0)
 
 
+supervisor = Supervisor(robot, ROOT / "data" / "runtime.json")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global broadcaster_task
@@ -105,11 +111,14 @@ async def lifespan(app: FastAPI):
     robot.bind_broadcast(broadcast)
     await robot.boot()
     await robot.start()
+    if supervisor.cfg.get("always_on", True):
+        supervisor.start()
     broadcaster_task = asyncio.create_task(pulse(), name="pulse")
     log.info("FablMyLog online  mode=%s  watch=%d", robot.mode, len(robot.watchlist))
     yield
     if broadcaster_task:
         broadcaster_task.cancel()
+    await supervisor.stop()
     await robot.stop()
     await hub.stop()
     await store.close()
@@ -136,6 +145,256 @@ async def index():
 @app.get("/health")
 async def health():
     return {"ok": True, "mode": robot.mode, "running": robot.running}
+
+
+# --------------------------------------------------------------------------- #
+# coin selection · trade quality · exchange keys · 24/7 runtime
+# --------------------------------------------------------------------------- #
+
+
+class TradeSetBody(BaseModel):
+    mode: str | None = None
+    symbols: list[str] | None = None
+    pinned: list[str] | None = None
+    auto_top_n: int | None = None
+    auto_metric: str | None = None
+    auto_min_volume: float | None = None
+    per_symbol: dict[str, dict[str, Any]] | None = None
+
+
+class SymbolToggleBody(BaseModel):
+    symbol: str
+    on: bool | None = None
+    size_mult: float | None = None
+
+
+class EdgeBody(BaseModel):
+    patch: dict[str, Any]
+
+
+class KeyBody(BaseModel):
+    venue: str
+    key: str
+    secret: str
+    passphrase: str = ""
+    testnet: bool = False
+
+
+class VenueBody(BaseModel):
+    venue: str
+    on: bool = True
+
+
+class ArmBody(BaseModel):
+    confirm: str = ""
+    venue: str = "binance"
+    max_notional: float = 50.0
+
+
+class RuntimeBody(BaseModel):
+    patch: dict[str, Any]
+
+
+@app.get("/api/trading/selection")
+async def api_trading_selection():
+    """Which coins the bot may trade, and everything it could trade."""
+    sel = robot.tradeset.to_dict(robot.watchlist)
+    rows = {r.get("symbol"): r for r in (robot.screener.get("rows") or [])}
+    active = set(sel["active"])
+    sel["candidates"] = [
+        {
+            "symbol": sym,
+            "selected": sym in robot.tradeset.symbols,
+            "active": sym in active,
+            "in_position": sym in robot.positions,
+            "enabled": (robot.tradeset.per_symbol.get(sym) or {}).get("enabled", True),
+            "size_mult": robot.tradeset.size_multiplier(sym),
+            "score": (rows.get(sym) or {}).get("alpha"),
+            "alpha": (rows.get(sym) or {}).get("alpha"),
+            "trend": (rows.get(sym) or {}).get("trend_score"),
+            "price": (rows.get(sym) or {}).get("last"),
+            "change_pct": (rows.get(sym) or {}).get("change_pct"),
+        }
+        for sym in robot.watchlist
+    ]
+    return sel
+
+
+@app.post("/api/trading/selection")
+async def api_trading_selection_set(body: TradeSetBody):
+    patch = {k: v for k, v in body.model_dump().items() if v is not None}
+    robot.tradeset.configure(patch)
+    if robot.tradeset.mode == "auto":
+        robot.tradeset.refresh_auto(robot.last_scan_rows)
+    return await api_trading_selection()
+
+
+@app.post("/api/trading/toggle")
+async def api_trading_toggle(body: SymbolToggleBody):
+    sym = body.symbol.upper().replace("-", "/")
+    if body.size_mult is not None:
+        robot.tradeset.configure({"per_symbol": {sym: {"size_mult": body.size_mult}}})
+    if body.on is None or body.size_mult is None:
+        robot.tradeset.toggle(sym, body.on)
+    return await api_trading_selection()
+
+
+@app.post("/api/trading/select_all")
+async def api_trading_select_all(on: bool = True):
+    robot.tradeset.select(robot.watchlist if on else [], mode="selected")
+    return await api_trading_selection()
+
+
+@app.get("/api/edge")
+async def api_edge():
+    return robot.edge.stats()
+
+
+@app.post("/api/edge")
+async def api_edge_set(body: EdgeBody):
+    return {"ok": True, "cfg": robot.edge.configure(body.patch)}
+
+
+@app.post("/api/edge/reset")
+async def api_edge_reset():
+    return {"ok": True, "cfg": robot.edge.reset_config()}
+
+
+@app.get("/api/edge/rejections")
+async def api_edge_rejections(limit: int = Query(40, ge=1, le=120)):
+    """Why the bot did not take the trades it saw."""
+    stats = robot.edge.stats()
+    return {
+        "rejections": stats["recent_rejections"][:limit],
+        "top_blocks": stats["top_blocks"],
+        "accepted": stats["accepted"],
+        "rejected": stats["rejected"],
+    }
+
+
+@app.post("/api/edge/preview")
+async def api_edge_preview(symbol: str):
+    """Score a symbol as if a signal had just fired — useful for tuning."""
+    sym = symbol.upper().replace("-", "/")
+    t = hub.quote(sym)
+    if not t:
+        return {"ok": False, "error": f"no live quote for {sym}"}
+    atr_val = robot._atr_value(sym)
+    sig = Signal(
+        strategy="preview",
+        symbol=sym,
+        kind=SignalKind.BUY,
+        confidence=0.7,
+        price=t.last,
+        reason="preview",
+        ts=time.time(),
+    )
+    decision = robot.edge.evaluate(sym, robot._edge_context(sig, t, atr_val))
+    equity = robot.mark_equity
+    plan = robot.edge.position_size(
+        equity, t.last, atr_val, decision,
+        equity * settings.risk.max_position_pct, wins=robot.wins, losses=robot.losses,
+    )
+    return {"ok": True, "symbol": sym, "decision": decision, "size_plan": plan,
+            "atr": atr_val, "price": t.last}
+
+
+@app.get("/api/keys")
+async def api_keys_list():
+    return robot.keys.listing()
+
+
+@app.post("/api/keys")
+async def api_keys_set(body: KeyBody):
+    try:
+        return {"ok": True, "venue": robot.keys.set(
+            body.venue, body.key, body.secret, body.passphrase, body.testnet
+        )}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.delete("/api/keys/{venue}")
+async def api_keys_delete(venue: str):
+    return {"ok": robot.keys.delete(venue.lower()), "venues": robot.keys.listing()["venues"]}
+
+
+@app.post("/api/keys/test")
+async def api_keys_test(body: VenueBody):
+    """Signed, read-only balance call. Never places an order."""
+    return await robot.live.test_connection(body.venue)
+
+
+@app.post("/api/keys/trading")
+async def api_keys_trading(body: VenueBody):
+    try:
+        return {"ok": True, "venue": robot.keys.set_trade_enabled(body.venue, body.on)}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.get("/api/live")
+async def api_live_state():
+    venue = robot.live_venue
+    can, why = robot.live.can_trade(venue)
+    return {
+        "mode": robot.mode,
+        "armed": robot.live_armed,
+        "venue": venue,
+        "max_notional": robot.max_live_notional,
+        "can_trade": can,
+        "reason": why,
+        "errors": robot.live_errors[:10],
+        "tradable_venues": list(TRADABLE_VENUES),
+    }
+
+
+@app.post("/api/live/arm")
+async def api_live_arm(body: ArmBody):
+    """Arm live order routing. Requires an explicit typed confirmation."""
+    if body.confirm.strip().upper() != "ARM LIVE":
+        return {"ok": False, "error": 'type "ARM LIVE" to confirm real orders'}
+    venue = body.venue.lower()
+    can, why = robot.live.can_trade(venue)
+    if not can:
+        return {"ok": False, "error": why}
+    test = (robot.keys.data.get(venue) or {}).get("last_test") or {}
+    if not test.get("ok"):
+        return {"ok": False, "error": "run a successful connection test for this venue first"}
+    robot.live_venue = venue
+    robot.max_live_notional = max(1.0, float(body.max_notional))
+    robot.live_armed = True
+    robot.mode = "live"
+    robot.notes.insert(0, {"ts": time.time(), "kind": "live",
+                           "text": f"live routing armed on {venue}, max ${robot.max_live_notional:.0f}/order"})
+    return await api_live_state()
+
+
+@app.post("/api/live/disarm")
+async def api_live_disarm():
+    robot.live_armed = False
+    robot.mode = "paper"
+    robot.notes.insert(0, {"ts": time.time(), "kind": "live", "text": "live routing disarmed — back to paper"})
+    return await api_live_state()
+
+
+@app.get("/api/uptime")
+async def api_uptime():
+    return supervisor.status()
+
+
+@app.post("/api/uptime")
+async def api_uptime_set(body: RuntimeBody):
+    cfg = supervisor.configure(body.patch)
+    if cfg.get("always_on", True):
+        supervisor.start()
+    return supervisor.status()
+
+
+@app.post("/api/uptime/check")
+async def api_uptime_check():
+    """Run one supervision pass right now."""
+    return {"ok": True, "did": await supervisor.tick(), "status": supervisor.status()}
 
 
 @app.get("/api/state")

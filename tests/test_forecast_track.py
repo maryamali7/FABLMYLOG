@@ -12,11 +12,17 @@ from app.indicators import RollingWindow
 from app.timeframes import mtf_history
 
 
+# Fixed, hour-aligned epoch: higher-timeframe buckets are cut on wall-clock
+# boundaries, so a wall-clock start makes resampling tests depend on the hour
+# they happen to run in.
+EPOCH = 1_700_000_000 - (1_700_000_000 % 3600)
+
+
 def window(bars: int = 2500, drift: float = 0.00012, seed: int = 5) -> RollingWindow:
     rng = random.Random(seed)
     win = RollingWindow(bars + 50)
     price = 100.0
-    start = time.time() - bars * 60
+    start = EPOCH - bars * 60
     for i in range(bars):
         price *= math.exp(rng.gauss(drift, 0.003))
         win.push(start + i * 60, price, price * 1.001, price * 0.999, price, 1000.0)

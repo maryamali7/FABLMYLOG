@@ -25,6 +25,7 @@
         <button class="nav" data-view="trade">Trade</button>
         <button class="nav" data-view="markets">Markets</button>
         <button class="nav" data-view="universe">Universe</button>
+        <button class="nav" data-view="bot">Bot control</button>
         <button class="nav" data-view="screeners">Screener Pro</button>
         <button class="nav" data-view="mtf">Multi-TF &amp; forecast</button>
         <button class="nav" data-view="builder">Strategy builder</button>
@@ -283,6 +284,121 @@
           </div>
         </div>
       </div>
+
+      <!-- ================= BOT CONTROL ================= -->
+      <section class="view" data-view="bot">
+        <div class="card">
+          <div class="card-h">
+            <div><h2>Coins the bot trades</h2><p class="sub" id="selSub">Analysis watches everything — trading only touches what you pick here</p></div>
+            <div class="row-btns">
+              <button class="btn tiny" id="selAll">Select all</button>
+              <button class="btn tiny" id="selNone">Clear</button>
+            </div>
+          </div>
+          <div class="tabs" id="selModes">
+            <button class="tab on" data-mode="selected">Only my picks</button>
+            <button class="tab" data-mode="all">Whole watchlist</button>
+            <button class="tab" data-mode="auto">Auto top movers</button>
+          </div>
+          <div class="filter-bar" id="selAutoBar" style="display:none">
+            <label class="muted">Top</label>
+            <input id="selTopN" class="mini tiny-num" type="number" min="1" max="25" value="5" />
+            <select id="selMetric" class="mini">
+              <option value="score">by score</option>
+              <option value="alpha">by alpha</option>
+              <option value="momentum">by momentum</option>
+              <option value="volume">by volume</option>
+            </select>
+            <input id="selMinVol" class="mini" type="number" placeholder="min 24h volume $" />
+            <span class="muted" id="selBasket"></span>
+          </div>
+          <div class="table-wrap">
+            <table class="data">
+              <thead><tr><th>Trade</th><th>Coin</th><th>Price</th><th>24h</th><th>Score</th><th>Size ×</th><th>Status</th></tr></thead>
+              <tbody id="selBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="fc-grid">
+          <div class="card">
+            <div class="card-h">
+              <div><h2>Edge engine</h2><p class="sub">Entry quality, sizing and exits — the win-rate knobs</p></div>
+              <div class="row-btns">
+                <button class="btn tiny" id="edgeSave">Save</button>
+                <button class="btn tiny" id="edgeReset">Defaults</button>
+              </div>
+            </div>
+            <div class="metric-grid" id="edgeKpis"></div>
+            <div id="edgeForm" class="edge-form"></div>
+          </div>
+          <div class="card">
+            <div class="card-h">
+              <div><h2>Why no trade?</h2><p class="sub">Every rejected signal, with the reason</p></div>
+              <button class="btn tiny" id="edgeRefresh">Refresh</button>
+            </div>
+            <div class="table-wrap">
+              <table class="data">
+                <thead><tr><th>Reason</th><th>Count</th></tr></thead>
+                <tbody id="edgeBlocks"></tbody>
+              </table>
+            </div>
+            <div class="table-wrap" style="margin-top:10px">
+              <table class="data">
+                <thead><tr><th>When</th><th>Coin</th><th>Score</th><th>Blocked by</th></tr></thead>
+                <tbody id="edgeRejects"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="fc-grid">
+          <div class="card">
+            <div class="card-h">
+              <div><h2>Exchange API keys</h2><p class="sub" id="keyNote">Stored encrypted on this machine — never shown again after saving</p></div>
+            </div>
+            <div class="filter-bar">
+              <select id="keyVenue" class="mini"></select>
+              <input id="keyKey" class="mini" placeholder="API key" autocomplete="off" />
+              <input id="keySecret" class="mini" type="password" placeholder="API secret" autocomplete="new-password" />
+              <input id="keyPass" class="mini" type="password" placeholder="passphrase (if required)" autocomplete="new-password" />
+              <button class="btn tiny" id="keySave">Save key</button>
+            </div>
+            <div class="table-wrap">
+              <table class="data">
+                <thead><tr><th>Venue</th><th>Key</th><th>Orders</th><th>Last test</th><th></th></tr></thead>
+                <tbody id="keyBody"></tbody>
+              </table>
+            </div>
+            <div id="liveBox" class="fb" style="margin-top:12px"></div>
+            <div class="filter-bar">
+              <select id="liveVenue" class="mini"></select>
+              <input id="liveMax" class="mini tiny-num" type="number" value="50" min="1" />
+              <input id="liveConfirm" class="mini" placeholder='type ARM LIVE' />
+              <button class="btn tiny danger" id="liveArm">Arm live trading</button>
+              <button class="btn tiny" id="liveDisarm">Disarm</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-h">
+              <div><h2>24/7 runtime</h2><p class="sub" id="upSub">Watchdog, daily reset and maintenance window</p></div>
+              <div class="row-btns">
+                <button class="btn tiny" id="upSave">Save</button>
+                <button class="btn tiny" id="upCheck">Run check</button>
+              </div>
+            </div>
+            <div class="metric-grid" id="upKpis"></div>
+            <div id="upForm" class="edge-form"></div>
+            <div class="table-wrap" style="margin-top:10px">
+              <table class="data">
+                <thead><tr><th>When</th><th>Event</th><th>Detail</th></tr></thead>
+                <tbody id="upEvents"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
 
       <!-- ================= SCREENER PRO ================= -->
       <section class="view" data-view="screeners">
@@ -685,5 +801,6 @@
   <script src="/static/pro.js"></script>
   <script src="/static/mtf.js"></script>
   <script src="/static/universe.js"></script>
+  <script src="/static/bot.js"></script>
 </body>
 </html>

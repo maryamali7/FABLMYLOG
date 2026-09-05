@@ -35,9 +35,11 @@ The robot boots, seeds 1m candles, connects every enabled exchange websocket, an
 | Mode | How | What happens |
 |------|-----|----------------|
 | `paper` (default) | no keys needed | Fills at live bid/ask plus configured fees & slippage |
-| `live` | `.env` keys + `BOT_MODE=live` | Signed REST orders (Binance market) — **real money** |
+| `live` | keys in the dashboard (or `.env`), connection test passed, orders enabled for the venue, then type `ARM LIVE` | Signed market orders on Binance/Bybit spot, capped per entry — **real money** |
 
-Copy `.env.example` to `.env` only if you intend to go live. Never commit secrets.
+Keys entered in the dashboard are encrypted at rest under `data/` and never
+returned to the browser; `.env` still works if you prefer. Never commit secrets.
+See **Bot control** below for the full arming sequence and the 24/7 supervisor.
 
 Crypto trading can lose 100% of capital. This is software, not financial advice.
 
@@ -57,7 +59,10 @@ Binance REST ─┘
         └────────► Forecast ensemble (6 models)
                     │
                     ▼
-              Strategy ensemble  →  RiskGate  →  Paper (or live) execution
+         Strategy ensemble → TradeSet (coin picker) → Edge gate (quality,
+              sizing, exits) → RiskGate → Paper or live execution
+                    │                              ▲
+                    │                   Supervisor (24/7 watchdog)
                     │
                     ▼
               SQLite journal + FastAPI / WebSocket dashboard
@@ -247,6 +252,107 @@ Those rows are tagged `source: "offline"` and the UI shows a red banner saying s
 data is never presented as market data. Partial success is never overwritten: if twenty
 catalogs load and two fail, you get the twenty plus the two listed failures.
 
+## Bot control: what it trades, how well, and around the clock
+
+### Pick the coins it trades
+
+Watching and trading are separate. The **Bot control** view lists every coin on
+the watchlist with a checkbox — tick one, tick ten, or switch mode:
+
+| Mode | Behaviour |
+|---|---|
+| `selected` | trade exactly the coins you ticked (default; nothing trades until you pick) |
+| `all` | trade anything on the watchlist |
+| `auto` | trade the top N coins by score / alpha / momentum / volume, refreshed as the board moves, with optional pinned coins and a volume floor |
+
+Per-coin you can also set a **size multiplier** (0.1×–3×) or disarm a single coin
+without retyping the list. Selection is persisted in `data/trading.json`, so a
+restart resumes exactly where you left off. Positions already open are always
+managed to their exit, even if you untick the coin.
+
+### Edge engine — the win-rate and ROI layer
+
+The strategy ensemble says *"this looks interesting"*. The edge engine decides
+whether it is worth money:
+
+**Entry gate** scores every candidate 0-100 across eight factors — signal
+confidence, multi-timeframe agreement, forecast probability, market regime,
+trend location, volatility band, spread/liquidity, and the *live* track record
+of that strategy and that coin. Hard blocks reject outright: timeframes
+disagreeing, bearish higher-timeframe bias, risk-off regime, RSI overextended,
+ATR too dead or too wild, spread too wide, daily trade cap, consecutive-loss
+stand-down, per-coin cooldown, too many correlated positions, out-of-session
+hours, and any strategy whose live win rate has fallen below your floor.
+
+Every rejection is stored with its reason and surfaced in a **"Why no trade?"**
+panel — the bot tells you exactly what it is waiting for instead of sitting
+silently.
+
+**Sizing** is volatility-targeted: risk a fixed % of equity per trade based on
+ATR rather than a fixed notional, then scale by quality score and a Kelly
+fraction derived from live results (capped, and floored so a bad streak shrinks
+size instead of stopping it dead).
+
+**Exits** are managed on every tick: ATR stop, break-even move at your chosen R,
+a two-step partial-profit ladder, ATR trailing once in profit, a giveback lock
+(never let a 3R winner become a loser) and a time stop for trades that go
+nowhere. All of it is tunable from the dashboard and persisted in
+`data/edge.json`.
+
+### Exchange API keys
+
+Add keys per venue in the dashboard. They are **encrypted at rest** (Fernet;
+set `FABL_SECRET_KEY` to control the key) in `data/api_keys.json` with `0600`
+permissions, and the API only ever returns a masked fingerprint — the secret is
+never sent back to the browser. `.env` variables still work as a fallback.
+
+Going live is deliberately awkward, in this order:
+
+1. save the key and secret (plus passphrase for OKX/KuCoin/Bitget),
+2. run **Test** — a signed, read-only balance call,
+3. flip **orders** on for that venue,
+4. type `ARM LIVE`, choose the venue and a per-order notional cap.
+
+Order routing is implemented for **Binance and Bybit spot**. Other venues store
+credentials and can be connection-tested, but the router refuses to invent a
+signing scheme it cannot verify. Live orders mirror the paper engine: the same
+entry gate, sizing and exits, capped by `max_notional` per entry, with routing
+errors surfaced instead of swallowed.
+
+### Running 24/7
+
+A supervisor task runs beside the bot:
+
+- **stall watchdog** — restarts the trading loop if it stops ticking for
+  `stall_timeout_sec`,
+- **daily roll** — resets the loss budget and trade counter at a chosen UTC hour,
+- **auto-resume** — optionally clears a risk halt after a cooling-off period,
+- **maintenance window** — pause (and optionally flatten) during a UTC hour range,
+- **uptime accounting** — uptime, loop age, restart count and an event log.
+
+For real 24/7 you still want the process supervised by the OS:
+
+```ini
+# /etc/systemd/system/fablmylog.service
+[Unit]
+Description=FablMyLog trading terminal
+After=network-online.target
+
+[Service]
+WorkingDirectory=/opt/FABLMYLOG
+ExecStart=/opt/FABLMYLOG/.venv/bin/python -m app
+Environment=FABL_SECRET_KEY=change-me
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable --now fablmylog     # or: docker run --restart=unless-stopped ...
+```
+
 ## Alert rules & analytics
 
 Alert rules reuse the same rule engine against screener rows, with severity, message
@@ -289,6 +395,15 @@ per-exit-reason and hourly edge tables, streaks, a PnL histogram and equity-curv
 | GET | `/api/instruments/carry` | cash-and-carry ranking (funding APR + basis) |
 | GET | `/api/instruments/movers` | 24h gainers and losers across all venues |
 | GET | `/api/instruments/exclusives` | coins listed on a single venue |
+| GET/POST | `/api/trading/selection` | which coins the bot may trade |
+| POST | `/api/trading/toggle` · `/select_all` | arm one coin, set its size ×, arm/clear all |
+| GET/POST | `/api/edge` · `/api/edge/reset` | edge-engine stats and tuning |
+| GET | `/api/edge/rejections` | why signals were not taken |
+| POST | `/api/edge/preview` | score a symbol as if a signal fired |
+| GET/POST/DELETE | `/api/keys` · `/api/keys/{venue}` | encrypted credential store |
+| POST | `/api/keys/test` · `/api/keys/trading` | signed read-only test, enable orders |
+| GET | `/api/live` · `POST /api/live/arm` · `/disarm` | live routing state and arming |
+| GET/POST | `/api/uptime` · `POST /api/uptime/check` | 24/7 supervisor |
 
 ## Config
 
@@ -305,7 +420,11 @@ docker build -t fablmylog .
 docker run --restart=always -p 8000:8000 --env-file .env fablmylog
 ```
 
-Keep the process under systemd, Docker, or any supervisor. Websocket clients reconnect with backoff; the loop never sleeps the risk manager.
+Keep the process under systemd, Docker, or any supervisor — there is a systemd
+unit in **Bot control** above, and the in-process supervisor (stall watchdog,
+daily roll, auto-resume, maintenance window) handles everything short of the
+process dying. Websocket clients reconnect with backoff; the loop never sleeps
+the risk manager.
 
 If the host cannot complete TLS to the venues (some locked-down sandboxes), FablMyLog automatically runs a **paper simulated tape** so the robot, risk engine, and dashboard stay alive. The moment Binance/Bybit/OKX/Coinbase/Kraken are reachable, live sockets take priority over the simulator.
 

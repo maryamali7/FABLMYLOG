@@ -23,6 +23,10 @@ from app.predict import rank_forecasts
 from app.rules import FRAMES
 from app.storage import Store
 from app.timeframes import MTFEngine
+from app.edge import EdgeEngine
+from app.keys import KeyStore
+from app.live import LiveRouter
+from app.tradeset import TradeSet
 from app.universe import Universe
 from app.strategies import build_strategies, ensemble
 
@@ -129,6 +133,15 @@ class Robot:
         self.loop_ms = 0.0
         self.tracker = ForecastTracker(ROOT / "data" / "forecast_log.json")
         self.instruments = Universe()
+        # --- coin selection, trade quality and live-trading plumbing ---
+        self.tradeset = TradeSet(ROOT / "data" / "trading.json")
+        self.edge = EdgeEngine(ROOT / "data" / "edge.json")
+        self.keys = KeyStore(ROOT / "data" / "api_keys.json")
+        self.live = LiveRouter(self.keys)
+        self.live_armed = False
+        self.live_venue = "binance"
+        self.max_live_notional = 50.0
+        self.live_errors: list[dict[str, Any]] = []
         set_context_provider(self.symbol_context)
 
     def refresh_strategies(self) -> None:
@@ -283,6 +296,7 @@ class Robot:
                 for a in self.screener.get("alerts") or []:
                     self.alerts.insert(0, a)
                 self.alerts = self.alerts[:40]
+                self.tradeset.refresh_auto(self.last_scan_rows)
                 await self._run_alert_rules(self.last_scan_rows)
             except Exception as exc:
                 log.debug("screener: %s", exc)
@@ -291,6 +305,7 @@ class Robot:
             return
 
         fresh_signals: list[dict[str, Any]] = []
+        tradable = set(self.tradeset.active(self.watchlist))
         for sym in self.watchlist:
             t = self.hub.quote(sym)
             if not t:
@@ -311,7 +326,8 @@ class Robot:
             combined = ensemble(raw, self.settings.risk.min_confidence)
             if combined:
                 fresh_signals.append(combined.to_dict())
-                await self._maybe_enter(combined, t)
+                if sym in tradable or sym in self.positions:
+                    await self._maybe_enter(combined, t)
 
         self.signals = fresh_signals[:80]
 
@@ -324,17 +340,42 @@ class Robot:
         if sig.kind == SignalKind.SELL and sig.symbol in self.positions:
             await self._close(sig.symbol, t.last, f"signal {sig.reason}")
             return
-        notional = self.risk.size(self.mark_equity, sig.confidence)
-        if not self.regime.get("risk_on", True):
-            notional *= 0.55
-        wr = self.wins / max(1, self.wins + self.losses)
-        if self.wins + self.losses >= 8:
-            kelly = max(0.45, min(1.15, 0.5 + (wr - 0.5)))
-            notional *= kelly
-        ok, why = self.risk.allow_entry(t, self.positions, self.mark_equity, notional)
-        if not ok:
+        allowed, why = self.tradeset.allows(sig.symbol, self.watchlist)
+        if not allowed:
+            self.edge.reject({"symbol": sig.symbol, "strategy": sig.strategy, "score": 0, "blocks": [why]})
             return
+
+        equity = self.mark_equity
+        atr_val = self._atr_value(sig.symbol)
         px = self._fill_price(t, Side.BUY)
+        decision: dict[str, Any] = {"passed": True, "score": 100.0, "size_mult": 1.0, "blocks": []}
+        if self.edge.cfg.get("enabled", True):
+            decision = self.edge.evaluate(sig.symbol, self._edge_context(sig, t, atr_val))
+            if not decision["passed"]:
+                self.edge.reject(decision)
+                return
+
+        legacy = self.risk.size(equity, sig.confidence)
+        if not self.regime.get("risk_on", True):
+            legacy *= 0.55
+        cap = equity * self.settings.risk.max_position_pct
+        if self.edge.cfg.get("enabled", True):
+            plan = self.edge.position_size(
+                equity, px, atr_val, decision, cap, wins=self.wins, losses=self.losses
+            )
+            notional = plan["notional"]
+        else:
+            plan = {"notional": legacy}
+            notional = legacy
+        notional *= self.tradeset.size_multiplier(sig.symbol)
+        notional = min(notional, cap)
+        if notional <= 0:
+            return
+        ok, why = self.risk.allow_entry(t, self.positions, equity, notional)
+        if not ok:
+            self.edge.reject({"symbol": sig.symbol, "strategy": sig.strategy,
+                              "score": decision.get("score"), "blocks": [why]})
+            return
         fee = notional * (self.settings.risk.fee_bps / 10_000)
         if self.cash < notional + fee:
             return
@@ -342,18 +383,8 @@ class Robot:
         extras = sig.extras or {}
         stop_pct = float(extras.get("stop_loss_pct") or self.settings.risk.stop_loss_pct)
         take_pct = float(extras.get("take_profit_pct") or self.settings.risk.take_profit_pct)
-        stop = px * (1 - stop_pct)
-        take = px * (1 + take_pct)
-        atr_val = 0.0
-        win = self.hub.candles.get(sig.symbol)
-        if win:
-            win = win.tail(180)
-        if win and len(win) >= 20:
-            a = atr(list(win.highs), list(win.lows), list(win.closes))[-1]
-            if a and a == a:
-                atr_val = float(a)
-                stop = min(stop, px - 1.6 * atr_val)
-                take = max(take, px + 2.4 * atr_val)
+        levels = self.edge.initial_levels(px, atr_val, px * (1 - stop_pct), px * (1 + take_pct))
+        stop, take = levels["stop"], levels["take"]
         pos = Position(
             symbol=sig.symbol,
             side=Side.BUY,
@@ -370,9 +401,15 @@ class Robot:
             trail_pct=float(extras.get("trail_pct") or 0.0),
             spec_id=str(extras.get("spec_id") or ""),
             confidence=round(float(sig.confidence), 3),
+            risk=round(levels["risk"], 10),
+            quality=float(decision.get("score") or 0.0),
         )
+        order_ref = await self._route_live_entry(sig.symbol, notional)
+        if order_ref:
+            pos.live_order = order_ref
         self.cash -= notional + fee
         self.positions[sig.symbol] = pos
+        self.edge.note_entry(sig.symbol)
         fill = Fill(
             id=uuid.uuid4().hex[:12],
             symbol=sig.symbol,
@@ -394,8 +431,79 @@ class Robot:
                 "stop": stop,
                 "take": take,
                 "confidence": sig.confidence,
+                "quality": pos.quality,
+                "size_plan": plan,
             },
         )
+
+    def _atr_value(self, symbol: str) -> float:
+        win = self.hub.candles.get(symbol)
+        if win:
+            win = win.tail(180)
+        if not win or len(win) < 20:
+            return 0.0
+        try:
+            a = atr(list(win.highs), list(win.lows), list(win.closes))[-1]
+        except Exception:
+            return 0.0
+        return float(a) if a and a == a else 0.0
+
+    def _edge_context(self, sig: Signal, t: Ticker, atr_val: float) -> dict[str, Any]:
+        """Everything the quality gate needs, gathered from the live engine."""
+        row = next((r for r in self.last_scan_rows if r.get("symbol") == sig.symbol), {})
+        mtf = {}
+        try:
+            mtf = self.mtf.flat_fields(sig.symbol) or {}
+        except Exception:
+            pass
+        fc = self.forecasts.get(sig.symbol) or {}
+        prob = fc.get("prob_up")
+        base = sig.symbol.split("/")[0]
+        correlated = sum(1 for s in self.positions if s.split("/")[0] != base)
+        return {
+            "confidence": sig.confidence,
+            "strategy": sig.strategy,
+            "mtf_agreement": mtf.get("mtf_agreement"),
+            "mtf_bias": mtf.get("mtf_bias"),
+            "forecast_prob": prob,
+            "risk_on": bool(self.regime.get("risk_on", True)),
+            # screener trend_score is 0-100; the gate wants -1..+1
+            "trend_score": (float(row["trend_score"]) / 50.0 - 1.0) if row.get("trend_score") is not None else 0.0,
+            "rsi": row.get("rsi"),
+            "atr_pct": row.get("atr_pct") if row.get("atr_pct") is not None
+            else ((atr_val / t.last * 100.0) if (atr_val and t.last) else None),
+            "spread_bps": t.spread_bps,
+            "quote_volume": row.get("quote_volume") or (float(row.get("volume") or 0) * (t.last or 0)) or None,
+            "open_correlated": correlated,
+        }
+
+    async def _route_live_entry(self, symbol: str, notional: float) -> str:
+        """Mirror a paper entry onto the exchange, when live trading is armed."""
+        if not self.live_armed or self.mode != "live":
+            return ""
+        amount = min(notional, self.max_live_notional)
+        try:
+            res = await self.live.market_buy(self.live_venue, symbol, amount)
+            ref = str(res.get("orderId") or (res.get("result") or {}).get("orderId") or "sent")
+            log.info("live buy %s %.2f -> %s", symbol, amount, ref)
+            return ref
+        except Exception as exc:
+            self.live_errors.insert(0, {"ts": time.time(), "symbol": symbol, "side": "buy", "error": str(exc)[:200]})
+            self.live_errors = self.live_errors[:20]
+            log.error("live buy failed for %s: %s", symbol, exc)
+            await self.emit("live_error", {"symbol": symbol, "side": "buy", "error": str(exc)[:200]})
+            return ""
+
+    async def _route_live_exit(self, pos: Position, qty: float) -> None:
+        if not self.live_armed or self.mode != "live" or not pos.live_order:
+            return
+        try:
+            await self.live.market_sell(self.live_venue, pos.symbol, qty)
+        except Exception as exc:
+            self.live_errors.insert(0, {"ts": time.time(), "symbol": pos.symbol, "side": "sell", "error": str(exc)[:200]})
+            self.live_errors = self.live_errors[:20]
+            log.error("live sell failed for %s: %s", pos.symbol, exc)
+            await self.emit("live_error", {"symbol": pos.symbol, "side": "sell", "error": str(exc)[:200]})
 
     def _fill_price(self, t: Ticker, side: Side) -> float:
         slip = self.settings.risk.slippage_bps / 10_000
@@ -412,22 +520,39 @@ class Robot:
             return
         px = t.last
         pos.unrealized = self._mtm(pos)
-        if pos.side == Side.BUY:
-            pos.peak = max(pos.peak, px)
-            trail_pct = pos.trail_pct or self.settings.risk.trailing_stop_pct
-            trail_stop = pos.peak * (1 - trail_pct)
-            if pos.atr:
-                trail_stop = max(trail_stop, pos.peak - 1.2 * pos.atr)
-            pos.trail = max(pos.stop, trail_stop)
-            if not pos.scaled and px >= pos.entry + 0.5 * (pos.take - pos.entry):
-                await self._scale_out(symbol, 0.5, "partial take 50% at 0.5R")
+        if pos.side != Side.BUY:
+            return
+        pos.peak = max(pos.peak, px)
+
+        if self.edge.cfg.get("enabled", True):
+            for action in self.edge.manage(pos, px):
+                kind = action.get("kind")
+                if kind == "stop":
+                    pos.stop = max(pos.stop, float(action["value"]))
+                    pos.trail = pos.stop
+                elif kind == "scale":
+                    pos.partials_taken += 1
+                    await self._scale_out(symbol, float(action["frac"]), action["reason"])
+                    if symbol not in self.positions:
+                        return
+                elif kind == "close":
+                    await self._close(symbol, px, action["reason"])
+                    return
+            pos = self.positions.get(symbol)
+            if not pos:
                 return
-            if px <= pos.trail:
-                await self._close(symbol, px, "stop / trailing stop")
-                return
-            if px >= pos.take:
-                await self._close(symbol, px, "take profit")
-                return
+
+        trail_pct = pos.trail_pct or self.settings.risk.trailing_stop_pct
+        trail_stop = pos.peak * (1 - trail_pct)
+        if pos.atr:
+            trail_stop = max(trail_stop, pos.peak - self.edge.cfg["atr_trail_mult"] * pos.atr)
+        pos.trail = max(pos.stop, trail_stop)
+        if px <= pos.trail:
+            await self._close(symbol, px, "stop / trailing stop")
+            return
+        if px >= pos.take:
+            await self._close(symbol, px, "take profit")
+            return
 
     async def _close(self, symbol: str, price: float, reason: str) -> None:
         pos = self.positions.pop(symbol, None)
@@ -438,6 +563,7 @@ class Robot:
         notional = pos.qty * px
         fee = notional * (self.settings.risk.fee_bps / 10_000)
         pnl = (px - pos.entry) * pos.qty - fee
+        await self._route_live_exit(pos, pos.qty)
         # restore cash: we spent entry*qty+entry_fee, receive exit notional - fee
         self.cash += notional - fee
         self.realized += pnl
@@ -447,6 +573,8 @@ class Robot:
         else:
             self.losses += 1
             self.risk.last_loss_ts = time.time()
+        r_mult = ((px - pos.entry) / pos.risk) if pos.risk else 0.0
+        self.edge.record_trade(pos.strategy, symbol, pnl, round(r_mult, 3))
         fill = Fill(
             id=uuid.uuid4().hex[:12],
             symbol=symbol,
@@ -471,6 +599,7 @@ class Robot:
             return
         qty = pos.qty * frac
         px = self._fill_price(t, Side.SELL)
+        await self._route_live_exit(pos, qty)
         notional = qty * px
         fee = notional * (self.settings.risk.fee_bps / 10_000)
         pnl = (px - pos.entry) * qty - fee
@@ -940,6 +1069,25 @@ class Robot:
             },
             "forecasts_cached": len(self.forecasts),
             "forecast_score": self._forecast_score(),
+            "trading": {
+                "mode": self.tradeset.mode,
+                "active": self.tradeset.active(self.watchlist),
+                "selected": len(self.tradeset.symbols),
+            },
+            "edge": {
+                "enabled": bool(self.edge.cfg.get("enabled", True)),
+                "min_quality": self.edge.cfg.get("min_quality"),
+                "accepted": self.edge.accepted,
+                "rejected": sum(self.edge.reject_counts.values()),
+                "trades_today": self.edge.trades_today,
+                "consecutive_losses": self.edge.consecutive_losses,
+            },
+            "live": {
+                "armed": self.live_armed,
+                "venue": self.live_venue,
+                "max_notional": self.max_live_notional,
+                "errors": len(self.live_errors),
+            },
             "instruments": {
                 "count": len(self.instruments.rows),
                 "source": self.instruments.report.get("source", "none"),
